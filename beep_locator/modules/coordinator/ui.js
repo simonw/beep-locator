@@ -836,7 +836,7 @@ export default function setup(ctx) {
       ? `<b>Rough mode.</b> Drag each dot to roughly where that listener is: each square is 1 m. Use Identify if you're not sure which is which. <button data-act="zoom-">Zoom out</button> <button data-act="zoom+">Zoom in</button> ${roomEdit ? '<button data-act="walls-remove">Remove walls</button> Drag the two square handles to the room\'s corners.' : '<button data-act="walls-add">Add walls</button>'} ${wizardRough ? "Click <b>Done, measure positions</b> when they are all placed." : "Untick rough mode when done and the listeners will chirp to measure their exact positions."}`
       : L && L.rough
         ? "These positions are your rough placement, not yet measured. Press Calibrate to measure."
-        : `Dots are listeners. <span style="color:${KIND_COLOR.beep}">&#10005;</span> beep, <span style="color:${KIND_COLOR.clap}">&#9671;</span> clap, <span style="color:${KIND_COLOR.test}">&#10005;</span> test beep (newest is largest). <span style="color:${MYS}">&#9678;</span> the mystery beep: ringed symbols are hearings of it, the bullseye is where they jointly point. Shading shows where the latest sound could plausibly be.`;
+        : `Dots are listeners. <span style="color:${KIND_COLOR.beep}">&#10005;</span> beep, <span style="color:${KIND_COLOR.clap}">&#9671;</span> clap, <span style="color:${KIND_COLOR.test}">&#10005;</span> test beep (newest is largest). <span style="color:${MYS}">&#9678;</span> the mystery beep: ringed symbols are hearings of it, the bullseye is where they jointly point. <span style="color:#2563eb">&#8853;</span> a suggested place for one more listener. Shading shows where the latest sound could plausibly be.`;
     if (roughMode) {
       // listeners that joined after rough mode started
       for (const id of listenerIds())
@@ -955,6 +955,20 @@ export default function setup(ctx) {
       parts.push(`<circle cx="${X(p)}" cy="${Y(p)}" r="${rr}" fill="${MYS}" fill-opacity="0.12" stroke="${MYS}" stroke-opacity="0.6" stroke-dasharray="5 4"/>`);
       parts.push(`<circle cx="${X(p)}" cy="${Y(p)}" r="10" fill="none" stroke="${MYS}" stroke-width="3"/><circle cx="${X(p)}" cy="${Y(p)}" r="3.5" fill="${MYS}"/>`);
       parts.push(`<text x="${X(p) + 15}" y="${Y(p) - 12}" font-size="14" font-weight="700" fill="${MYS}" stroke="var(--card)" stroke-width="3" paint-order="stroke">mystery beep · ${pooled.n} hearing${pooled.n === 1 ? "" : "s"} · within ~${pooled.radius_m >= 1 ? fmt(pooled.radius_m, 1) + " m" : Math.round(pooled.radius_m * 100) + " cm"}${pooled.at_edge ? " · may be further out" : ""}</text>`);
+    }
+    // where one more listener would help most
+    const sug = !roughMode && !viewing && state.settings && state.settings.suggestion;
+    if (sug && sug.gain >= 0.05) {
+      const p = viewTf([sug.x, sug.y]);
+      const SUG = "#2563eb";
+      const x = X(p),
+        y = Y(p);
+      const why = sug.basis === "mystery" ? `could tighten the mystery beep's position by ~${Math.round(sug.gain * 100)}%` : `would improve accuracy across the room by ~${Math.round(sug.gain * 100)}%`;
+      parts.push(`<g class="suggest"><title>Suggested place for one more listener. ${sug.basis === "mystery" ? `Worked out from where the ${sug.hearings} hearings of the mystery beep allow it to be and the directions the current listeners already cover.` : "Worked out from the directions the current listeners already cover."}</title>
+        <circle cx="${x}" cy="${y}" r="13" fill="${SUG}" fill-opacity="0.1" stroke="${SUG}" stroke-width="2.5" stroke-dasharray="5 4"/>
+        <line x1="${x - 6}" y1="${y}" x2="${x + 6}" y2="${y}" stroke="${SUG}" stroke-width="2.5"/><line x1="${x}" y1="${y - 6}" x2="${x}" y2="${y + 6}" stroke="${SUG}" stroke-width="2.5"/>
+        <text x="${x + 18}" y="${y + 4}" font-size="13" font-weight="600" fill="${SUG}" stroke="var(--card)" stroke-width="3" paint-order="stroke">add a listener here?</text>
+        <text x="${x + 18}" y="${y + 19}" font-size="11" fill="${SUG}" stroke="var(--card)" stroke-width="3" paint-order="stroke">${why}</text></g>`);
     }
     // estimates
     est.forEach((p, k) => {

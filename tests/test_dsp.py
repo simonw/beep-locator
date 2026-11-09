@@ -182,3 +182,28 @@ def test_refine_layout_keeps_unranged_device_where_placed():
     lay = dsp.refine_layout(D, X0)
     assert np.allclose(lay.positions[3], X0[3], atol=1e-6)
     assert np.abs(lay.fitted[:3, :3] - D[:3, :3]).max() < 0.02
+
+
+def test_suggested_listener_adds_the_missing_direction():
+    from beep_locator import mystery
+
+    # three listeners bunched on one side of a source: the useful fourth
+    # is on the far side of it, not next to the others
+    P = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 0.6]])
+    src = np.array([0.5, 3.0])
+    pts = src + np.array([[0, 0], [0.2, 0], [-0.2, 0], [0, 0.2], [0, -0.2]])
+    w = np.full(len(pts), 0.2)
+    s = mystery.suggest_listener(P, pts, w, margin=5.0)
+    assert s is not None and s["gain"] > 0.3
+    assert s["y"] > src[1]
+
+
+def test_source_belief_peaks_at_the_source():
+    from beep_locator import mystery
+
+    P = np.array([[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]])
+    src = np.array([1.0, 2.0])
+    T = np.sqrt(((P - src) ** 2).sum(1)) / dsp.SPEED_OF_SOUND + 5.0
+    pts, w = mystery.source_belief([(P, T)], P)
+    assert abs(w.sum() - 1) < 1e-9
+    assert np.hypot(*(pts[np.argmax(w)] - src)) < 0.25

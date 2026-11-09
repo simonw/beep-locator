@@ -180,6 +180,7 @@ async def _calibrate(hub: Hub, rounds, gap, devices) -> dict:
     layout["result_id"] = rid
     hub.layout = layout
     hub.mark_dirty()
+    _update_suggestion(hub)
     await hub.progress(
         f"Calibrated {len(ids)} devices: {summary['pairs_measured']}/{summary['pairs_total']} distances, "
         f"fit error {layout['rms_residual'] * 100:.1f}cm"
@@ -219,6 +220,26 @@ def _result_signature(hub: Hub, res: dict | None) -> dict | None:
             continue
         recs.append(analysis.Recording(row["device_id"], float(row["sr"]), int(row["start_frame"]), samples))
     return mystery.signature(recs, data.get("devices") or [])
+
+
+def _update_suggestion(hub: Hub, sets=None):
+    """Where one more listener would help most; shown on the map."""
+    layout = hub.layout or {}
+    skip = set(layout.get("unlocated") or [])
+    pos = [p for d, p in (layout.get("positions_by_id") or {}).items() if d not in skip]
+    sug = None
+    if len(pos) >= 3 and not layout.get("rough"):
+        try:
+            c = layout.get("speed_of_sound", hub.speed_of_sound)
+            pts, w = mystery.source_belief(sets, pos, c=c, bounds=_room(hub))
+            sug = mystery.suggest_listener(pos, pts, w, c=c, bounds=_room(hub))
+            if sug:
+                sug["basis"] = "mystery" if sets else "area"
+                sug["hearings"] = len(sets or [])
+        except Exception:
+            sug = None
+    hub.update_settings({"suggestion": sug})
+    hub.mark_dirty()
 
 
 # Bump when the way sounds are timed changes: older results are then re-timed
@@ -332,6 +353,7 @@ def _mystery_refresh(hub: Hub, m: dict, rescore: bool = False) -> dict:
     m["estimate"] = est
     m["matches"] = len(ids)
     m["pitch"] = f0
+    _update_suggestion(hub, sets)
     hub.update_settings({"mystery": m})
     hub.mark_dirty()
     return m
@@ -732,6 +754,7 @@ async def run(hub: Hub, name: str, args: dict | None = None):
         hub.view = {"rotation": 0.0, "flip": False}
         hub.store.set_setting("view", hub.view)
         hub.mark_dirty()
+        _update_suggestion(hub)
         return {"ok": True, "devices": len(ids)}
     if name == "reposition_start":
         # Step 1: stop reacting to sounds while the devices are carried about.
@@ -783,6 +806,7 @@ async def run(hub: Hub, name: str, args: dict | None = None):
                 {"rough_positions": {d: [float(np.cos(a) * fx * p[0] - np.sin(a) * p[1]), float(np.sin(a) * fx * p[0] + np.cos(a) * p[1])] for d, p in old_pos.items()}}
             )
         hub.layout = None
+        _update_suggestion(hub)
         # the confirmed beep is still the same beep; where it is must be
         # worked out afresh from the new positions
         mys["estimate"] = None
@@ -816,6 +840,7 @@ async def run(hub: Hub, name: str, args: dict | None = None):
         # forget what the mystery beep sounds like (it is otherwise kept
         # across sessions, since moving the listeners doesn't change the beep)
         hub.update_settings({"mystery": {"marked": {}, "scores": {}, "estimate": None, "matches": 0, "pitch": None}})
+        _update_suggestion(hub)
         await hub.progress("Forgot the mystery beep's sound. Mark a beep again to teach it.")
         hub.mark_dirty()
         return {"ok": True}

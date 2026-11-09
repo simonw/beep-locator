@@ -146,3 +146,98 @@ def locate_many(sets, c: float = dsp.SPEED_OF_SOUND, margin: float = 3.0, step: 
     radius = float(np.sqrt(((near - pts[k]) ** 2).sum(1)).max()) if len(near) else 0.0
     edge = bounds is None and bool(pts[k, 0] <= xmin + step or pts[k, 0] >= xmax - step or pts[k, 1] <= ymin + step or pts[k, 1] >= ymax - step)
     return {"x": float(pts[k, 0]), "y": float(pts[k, 1]), "radius_m": max(radius, step), "n": len(sets), "at_edge": edge}
+
+
+def _grid(allP, margin, step, bounds):
+    xmin, ymin = np.asarray(allP).min(0) - margin
+    xmax, ymax = np.asarray(allP).max(0) + margin
+    if bounds is not None:
+        xmin, xmax = sorted((float(bounds[0]), float(bounds[2])))
+        ymin, ymax = sorted((float(bounds[1]), float(bounds[3])))
+    GX, GY = np.meshgrid(np.arange(xmin, xmax + step / 2, step), np.arange(ymin, ymax + step / 2, step))
+    return np.stack([GX.ravel(), GY.ravel()], 1)
+
+
+def source_belief(sets, positions, c: float = dsp.SPEED_OF_SOUND, margin: float = 3.0, step: float = 0.2, sigma: float = 0.0015, bounds=None):
+    """
+    Where the source could plausibly be: (points, weights). Deliberately
+    broader than the pooled estimate's own error bar (sigma 1.5ms, about half
+    a metre), because that error bar ignores systematic timing errors. With
+    no hearings, every point of the searched area is equally likely.
+    """
+    positions = np.asarray(positions, dtype=np.float64)
+    pts = _grid(positions, margin, step, bounds)
+    sets = [(np.asarray(P, dtype=np.float64), np.asarray(T, dtype=np.float64)) for P, T in (sets or []) if len(T) >= 3]
+    if not sets:
+        return pts, np.full(len(pts), 1.0 / len(pts))
+    total = np.zeros(len(pts))
+    for P, T in sets:
+        tau = np.sqrt(((pts[:, None, :] - P[None, :, :]) ** 2).sum(-1)) / c
+        r = T[None, :] - tau
+        r -= r.mean(1, keepdims=True)
+        total += np.minimum((r**2).sum(1) / sigma**2, 9.0 * len(T))
+    # average rather than sum the hearings: more hearings of a biased timing
+    # do not make the bias smaller
+    w = np.exp(-(total - total.min()) / (2.0 * len(sets)) * 4.0)
+    return pts, w / w.sum()
+
+
+def suggest_listener(positions, pts, w, c: float = dsp.SPEED_OF_SOUND, margin: float = 1.5, step: float = 0.25, bounds=None, min_gap: float = 0.75):
+    """
+    The best place for one more listener, given where the existing ones are
+    and where the source might be (``pts`` with weights ``w``).
+
+    For a source at s, timing differences pin its position with a precision
+    set by the directions u_i from each listener to s:
+    J(s) = sum_i (u_i - mean u)(u_i - mean u)^T. The typical position error
+    scales with sqrt(trace(J^-1)). The suggestion is the spot that makes the
+    belief-weighted average of that as small as possible, i.e. the spot that
+    adds the direction the current listeners lack.
+    Returns {"x", "y", "gain"} (gain: fraction by which the expected error
+    shrinks) or None.
+    """
+    P = np.asarray(positions, dtype=np.float64)
+    if len(P) < 3:
+        return None
+    keep = np.argsort(w)[::-1]
+    keep = keep[np.cumsum(w[keep]) <= 0.97] if (np.cumsum(w[keep]) <= 0.97).any() else keep[:1]
+    if len(keep) > 400:
+        keep = keep[:: int(np.ceil(len(keep) / 400))]
+    S, ws = pts[keep], w[keep] / w[keep].sum()
+    centre = (S * ws[:, None]).sum(0)
+
+    def units(Q):  # (len(Q), len(S), 2): direction from each of Q to each source point
+        d = S[None, :, :] - Q[:, None, :]
+        return d / (np.sqrt((d**2).sum(-1, keepdims=True)) + 1e-6)
+
+    U = units(P)  # (n, S, 2)
+    n = len(P)
+    A = np.einsum("nsi,nsj->sij", U, U)
+    b = U.sum(0)
+
+    def err(A, b, m):
+        J = A - np.einsum("...i,...j->...ij", b, b) / m
+        det = J[..., 0, 0] * J[..., 1, 1] - J[..., 0, 1] * J[..., 1, 0]
+        return np.sqrt((J[..., 0, 0] + J[..., 1, 1]) / np.maximum(det, 1e-6))
+
+    now = float((err(A, b, n) * ws).sum())
+    C = _grid(P, margin, step, bounds)
+    ok = np.sqrt(((C[:, None, :] - P[None, :, :]) ** 2).sum(-1)).min(1) >= min_gap
+    # not on top of the likely source itself: that is the thing being looked for
+    spread = float(np.sqrt((((S - centre) ** 2).sum(1) * ws).sum()))
+    if spread < 1.5:
+        ok &= np.sqrt(((C - centre) ** 2).sum(1)) >= 0.5
+    C = C[ok]
+    if not len(C):
+        return None
+    Uc = units(C)  # (C, S, 2)
+    A2 = A[None] + np.einsum("csi,csj->csij", Uc, Uc)
+    b2 = b[None] + Uc
+    score = (err(A2, b2, n + 1) * ws[None, :]).sum(1)
+    # Only the direction a listener adds matters to this measure, so spots
+    # along a line away from the source score almost the same. Of those
+    # within 3% of the best, take the nearest to the likely source: closer is
+    # louder, and more likely to be inside the room.
+    near = np.flatnonzero(score <= score.min() * 1.03)
+    k = int(near[np.argmin(((C[near] - centre) ** 2).sum(1))])
+    return {"x": float(C[k, 0]), "y": float(C[k, 1]), "gain": float(1.0 - score[k] / now) if now > 0 else 0.0}
