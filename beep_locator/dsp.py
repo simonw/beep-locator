@@ -218,13 +218,45 @@ class Detection:
         }
 
 
+_SIDELOBE_CACHE: dict = {}
+
+
+def _sidelobe_profile(template: np.ndarray, max_lag: int = 120) -> np.ndarray:
+    """
+    Envelope of the template's autocorrelation at lags 1..max_lag, relative to
+    its peak: how large a sidelobe an arrival produces k samples before itself.
+    """
+    key = (len(template), float(template[len(template) // 3]), float(np.abs(template).sum()))
+    prof = _SIDELOBE_CACHE.get(key)
+    if prof is None:
+        t = np.asarray(template, dtype=np.float64)
+        x = np.concatenate([np.zeros(max_lag), t, np.zeros(max_lag)])
+        e = analytic_envelope(correlate_valid(x, t))
+        e = e / e[max_lag]
+        prof = np.maximum(e[max_lag - 1 :: -1], e[max_lag + 1 :])[:max_lag]
+        # ignore the main lobe itself (up to its first null)
+        rising = np.nonzero(np.diff(prof) > 0)[0]
+        prof[: (int(rising[0]) if len(rising) else 0)] = 0.0
+        # sidelobes of real speakers/mics are smeared: use a running maximum
+        # over neighbouring lags rather than the exact nulls
+        prof = np.array([prof[max(0, k - 3) : k + 4].max() for k in range(len(prof))])
+        if len(_SIDELOBE_CACHE) > 64:
+            _SIDELOBE_CACHE.clear()
+        _SIDELOBE_CACHE[key] = prof
+    return prof
+
+
 def detect_chirp(
     x: np.ndarray,
     template: np.ndarray,
     lo: int | None = None,
     hi: int | None = None,
     sr: float = 48000.0,
-    first_arrival_frac: float = 0.5,
+    # 0.15 rather than 0.5: in real rooms the direct path is often much weaker
+    # than a later reflection. On recorded calibrations 0.5 flipped between
+    # peaks from round to round (metre-sized errors); 0.15 gave consistent
+    # distances and a timing closure error several times smaller.
+    first_arrival_frac: float = 0.15,
     max_early: float = 0.015,
 ) -> Detection | None:
     """
@@ -246,14 +278,18 @@ def detect_chirp(
     noise = float(np.median(env)) + 1e-12
     snr = peak / noise
     # earliest local maximum within max_early before the peak that is at least
-    # first_arrival_frac of the peak
+    # first_arrival_frac of the peak, and is not just a correlation sidelobe
+    # of a stronger arrival shortly after it
     start = max(1, p - int(max_early * sr))
     first = p
     thresh = first_arrival_frac * peak
+    side = _sidelobe_profile(template)
     for i in range(start, p):
         if env[i] >= thresh and env[i] >= env[i - 1] and env[i] >= env[i + 1]:
-            first = i
-            break
+            later = env[i + 1 : i + 1 + len(side)]
+            if env[i] > 2.0 * float(np.max(later * side[: len(later)])):
+                first = i
+                break
     idx = parabolic_peak(env, first)
     strongest = parabolic_peak(env, p)
     return Detection(index=lo + idx, peak=peak, snr=snr, strongest_index=lo + strongest)
@@ -292,6 +328,8 @@ def detect_onset(
     smooth: float = 0.0005,
     min_snr_db: float = 8.0,
     frac: float = 0.5,
+    impulsive: bool = False,
+    above_floor_db: float | None = None,
 ) -> Onset | None:
     """
     Find the onset (leading edge) of the strongest burst in x[lo:hi].
@@ -300,6 +338,11 @@ def detect_onset(
     placed where the envelope first reaches ``frac`` of the first local
     maximum after that (the direct sound) rather than the global maximum
     (which reverberation can inflate).
+
+    impulsive=True is for claps and knocks: the onset is simply the first
+    sustained crossing of the low threshold. On recorded claps (50dB+ above
+    the room) that was consistent between listeners to a few centimetres,
+    where the two-stage rule was out by a metre or more.
     """
     x = np.asarray(x, dtype=np.float64)
     lo = 0 if lo is None else max(0, int(lo))
@@ -341,6 +384,31 @@ def detect_onset(
             i += 1
     if i1 is None:
         i1 = p
+    if above_floor_db is not None:
+        # Tonal beeps: the first moment the tone clearly rises out of the
+        # background, rather than a fraction of a peak that reverberation
+        # sets differently at every listener. On repeated hearings of a real
+        # smoke-alarm chirp this cut the misfit between listeners from about
+        # a metre to about 10cm.
+        q0, q1 = max(0, p - int(0.5 * sr)), max(1, p - int(0.1 * sr))
+        noise = float(np.percentile(seg[q0:q1], 95)) if q1 - q0 > 50 else floor
+        th = min(max(noise, 1e-9) * 10 ** (above_floor_db / 20), floor + 0.5 * (peak - floor))
+        hold2 = max(1, int(0.002 * sr))
+        ok = seg >= th
+        i = max(1, p - int(0.15 * sr))
+        while i < p and not (ok[i] and ok[i : i + hold2].all()):
+            i += 1
+        if seg[i] != seg[i - 1] and seg[i - 1] < th:
+            idx = (i - 1) + (th - seg[i - 1]) / (seg[i] - seg[i - 1])
+        else:
+            idx = float(i)
+        return Onset(index=lo + idx, peak=peak, floor=floor, snr_db=snr_db, freq=f_center)
+    if impulsive:
+        if i1 > 0 and seg[i1] != seg[i1 - 1] and seg[i1 - 1] < low:
+            idx = (i1 - 1) + (low - seg[i1 - 1]) / (seg[i1] - seg[i1 - 1])
+        else:
+            idx = float(i1)
+        return Onset(index=lo + idx, peak=peak, floor=floor, snr_db=snr_db, freq=None)
     # stage 2: local max within 8ms after i1
     w_end = min(len(seg), i1 + int(0.008 * sr))
     local = i1 + int(np.argmax(seg[i1:w_end])) if w_end > i1 else i1
@@ -559,6 +627,89 @@ def fit_layout(D: np.ndarray, W: np.ndarray | None = None, reject_outliers: bool
     return Layout(X, D, F, R, rms, excluded)
 
 
+def refine_layout(
+    D: np.ndarray,
+    X0: np.ndarray,
+    sigma_meas: float = 0.05,
+    sigma_prior: float = 1.0,
+    outlier: float = 0.15,
+) -> Layout:
+    """
+    Fit positions to measured distances, starting from (and weakly held to) a
+    rough placement X0 supplied by the user.
+
+    The rough placement does three jobs: it fixes rotation, translation and
+    mirror image, so the result is already in the user's frame; it gives a
+    position to devices nothing could range to; and it says *which*
+    measurement is wrong when they are inconsistent. (With few devices the
+    measurements alone can show that one is an echo but not which one: every
+    choice fits. The right choice is the one that moves the devices least
+    from where the user put them.)
+    """
+    from itertools import combinations
+
+    D = np.asarray(D, dtype=np.float64)
+    X0 = np.asarray(X0, dtype=np.float64)
+    n = len(D)
+    all_pairs = [(i, j) for i in range(n) for j in range(i + 1, n) if np.isfinite(D[i, j])]
+    wp = sigma_meas / sigma_prior
+
+    def solve(pairs):
+        X = X0.copy()
+        m = len(pairs)
+
+        def rj(X):
+            r = np.zeros(m + 2 * n)
+            J = np.zeros((m + 2 * n, 2 * n))
+            for k, (i, j) in enumerate(pairs):
+                v = X[i] - X[j]
+                d = float(np.hypot(*v)) + 1e-9
+                r[k] = d - D[i, j]
+                J[k, 2 * i : 2 * i + 2] = v / d
+                J[k, 2 * j : 2 * j + 2] = -v / d
+            r[m:] = wp * (X - X0).ravel()
+            J[m:] = wp * np.eye(2 * n)
+            return r, J
+
+        lam = 1e-3
+        r, J = rj(X)
+        for _ in range(200):
+            step = np.linalg.solve(J.T @ J + lam * np.eye(2 * n), -J.T @ r)
+            X2 = X + step.reshape(n, 2)
+            r2, J2 = rj(X2)
+            if float(r2 @ r2) <= float(r @ r):
+                X, r, J = X2, r2, J2
+                lam = max(lam / 3, 1e-9)
+                if np.abs(step).max() < 1e-7:
+                    break
+            else:
+                lam *= 10
+                if lam > 1e9:
+                    break
+        res = r[:m]
+        worst = float(np.abs(res).max()) if m else 0.0
+        return X, res, worst, float(((X - X0) ** 2).sum())
+
+    X, res, worst, _ = solve(all_pairs)
+    excluded: list = []
+    if worst > outlier:
+        max_drop = max(1, len(all_pairs) // 4)
+        for k in range(1, max_drop + 1):
+            best = None
+            for drop in combinations(range(len(all_pairs)), k):
+                keep = [p for q, p in enumerate(all_pairs) if q not in drop]
+                Xk, resk, worstk, moved = solve(keep)
+                if worstk <= outlier and (best is None or moved < best[0]):
+                    best = (moved, Xk, resk, drop)
+            if best is not None:
+                _, X, res, drop = best
+                excluded = [[int(all_pairs[q][0]), int(all_pairs[q][1])] for q in drop]
+                break
+    F = np.sqrt(((X[:, None, :] - X[None, :, :]) ** 2).sum(-1))
+    rms = float(np.sqrt(np.mean(np.square(res)))) if len(res) else 0.0
+    return Layout(X, D, F, np.where(np.isfinite(D), F - D, 0.0), rms, excluded)
+
+
 def procrustes_align(X: np.ndarray, Y: np.ndarray):
     """
     Find rotation/reflection + translation mapping X onto Y (no scaling).
@@ -609,17 +760,20 @@ def locate_tdoa(
     positions: np.ndarray,
     times: np.ndarray,
     c: float = SPEED_OF_SOUND,
-    margin: float = 1.5,
+    margin: float = 3.0,
     step: float = 0.05,
     sigma: float = 0.0005,
     grid_size: int = 48,
+    bounds=None,
 ) -> TdoaResult | None:
     """
     Find (x, y, t0) minimising sum (t_i - t0 - |p - p_i|/c)^2.
 
     A grid search over the bounding box of the listeners (plus margin) avoids
-    local minima, then Gauss-Newton refines the best cell. Also returns a
-    coarse likelihood grid for display.
+    local minima, then Gauss-Newton refines the best cell. The answer never
+    leaves the searched area: with inconsistent timings the refinement would
+    otherwise run off to infinity. Also returns a coarse likelihood grid for
+    display.
     """
     P = np.asarray(positions, dtype=np.float64)
     t = np.asarray(times, dtype=np.float64)
@@ -629,6 +783,10 @@ def locate_tdoa(
         return None
     xmin, ymin = P.min(0) - margin
     xmax, ymax = P.max(0) + margin
+    if bounds is not None:
+        # the room's walls, if the user has drawn them: nothing is outside
+        xmin, xmax = sorted((float(bounds[0]), float(bounds[2])))
+        ymin, ymax = sorted((float(bounds[1]), float(bounds[3])))
     xs = np.arange(xmin, xmax + step / 2, step)
     ys = np.arange(ymin, ymax + step / 2, step)
     GX, GY = np.meshgrid(xs, ys)
@@ -639,6 +797,7 @@ def locate_tdoa(
     cost = ((resid - t0[:, None]) ** 2).sum(1)
     k = int(np.argmin(cost))
     x, y, tt0 = pts[k, 0], pts[k, 1], t0[k]
+    gx0, gy0, gt0 = float(x), float(y), float(tt0)
     # Gauss-Newton refinement
     for _ in range(30):
         d = np.sqrt((x - P[:, 0]) ** 2 + (y - P[:, 1]) ** 2) + 1e-9
@@ -650,6 +809,10 @@ def locate_tdoa(
             break
         x, y, tt0 = x + delta[0], y + delta[1], tt0 + delta[2]
         if np.abs(delta[:2]).max() < 1e-5:
+            break
+        if not (np.isfinite(x) and np.isfinite(y)) or abs(x - gx0) > 2 * step or abs(y - gy0) > 2 * step:
+            # left the grid cell it started in: the refinement is diverging
+            x, y, tt0 = gx0, gy0, gt0
             break
     d = np.sqrt((x - P[:, 0]) ** 2 + (y - P[:, 1]) ** 2)
     r = t - tt0 - d / c

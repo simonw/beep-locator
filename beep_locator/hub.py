@@ -54,7 +54,7 @@ DEFAULT_SETTINGS = {
     "temperature_c": 20.0,
     "self_distance": 0.05,
     "chirp": {"f_lo": 2000.0, "f_hi": 7000.0, "duration": 0.08, "amplitude": 0.9},
-    "calibration_rounds": 2,
+    "calibration_rounds": 4,
     "calibration_gap": 1.0,
     "sync_gain": 1.0,
     # onset detector (runs on each listener)
@@ -178,6 +178,9 @@ class Hub:
             self.layout = latest["data"]["layout"]
             self.layout["result_id"] = latest["id"]
         self.view = store.get_settings().get("view", {"rotation": 0, "flip": False})
+        # device id -> {"ok", "ts", "how"}: did anything hear this device's
+        # speaker the last time it was asked to play?
+        self.speakers = store.get_settings().get("speakers", {}) or {}
         self.event_listeners: list = []
         self.suppress_windows: deque = deque(maxlen=50)
         self.procedure_lock = asyncio.Lock()
@@ -327,6 +330,7 @@ class Hub:
             "layout": self.layout,
             "settings": self.settings,
             "view": self.view,
+            "speakers": self.speakers,
             "public_url": self.public_url,
             "procedure": self.current_procedure,
             "server_time": time.time(),
@@ -446,6 +450,11 @@ class Hub:
                     self._module_mtimes[key] = m
             except Exception as e:  # pragma: no cover
                 print("module watcher error", e)
+
+    def set_speaker(self, device_id: str, ok: bool, how: str):
+        self.speakers[device_id] = {"ok": bool(ok), "ts": time.time(), "how": how}
+        self.store.set_setting("speakers", self.speakers)
+        self.mark_dirty()
 
     # -- settings ------------------------------------------------------------
     def update_settings(self, patch: dict):

@@ -138,3 +138,47 @@ def test_end_to_end_beep_location(seed):
     est = transform(np.array([[res["estimate"]["x"], res["estimate"]["y"]]]))[0]
     err = float(np.hypot(est[0] - src[0], est[1] - src[1]))
     assert err < 0.2, (err, est, src)
+
+
+def _rough_case(seed, n=4, err=0.8):
+    rng = np.random.default_rng(seed)
+    P = rng.uniform(-3, 3, size=(n, 2))
+    D = np.sqrt(((P[:, None] - P[None]) ** 2).sum(-1))
+    X0 = P + rng.uniform(-err, err, size=P.shape)
+    return P, D, X0
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_refine_layout_from_rough_placement(seed):
+    P, D, X0 = _rough_case(seed)
+    lay = dsp.refine_layout(D, X0)
+    assert np.abs(lay.fitted - D).max() < 0.02
+    assert lay.excluded_pairs == []
+    # the result stays in the user's own frame: no alignment step, and no
+    # device ends up further from the truth than the rough placement was
+    assert np.abs(lay.positions - P).max() < 0.8
+
+
+def test_refine_layout_usually_identifies_an_echo():
+    # Five devices, placed by hand to within 30cm, one distance 1.1m too long.
+    # Which distance is wrong is only decidable from the rough placement, so
+    # this is statistical rather than guaranteed.
+    hits = 0
+    for seed in range(40):
+        P, D, X0 = _rough_case(seed, n=5, err=0.3)
+        D[0, 2] = D[2, 0] = D[0, 2] + 1.1
+        lay = dsp.refine_layout(D, X0)
+        if lay.excluded_pairs == [[0, 2]]:
+            hits += 1
+            true = np.sqrt(((P[:, None] - P[None]) ** 2).sum(-1))
+            assert np.abs(lay.fitted - true).max() < 0.05
+    assert hits >= 32
+
+
+def test_refine_layout_keeps_unranged_device_where_placed():
+    P, D, X0 = _rough_case(3)
+    D[3, :] = D[:, 3] = np.nan
+    D[3, 3] = 0
+    lay = dsp.refine_layout(D, X0)
+    assert np.allclose(lay.positions[3], X0[3], atol=1e-6)
+    assert np.abs(lay.fitted[:3, :3] - D[:3, :3]).max() < 0.02

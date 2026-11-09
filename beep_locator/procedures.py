@@ -17,6 +17,7 @@ import time
 import numpy as np
 
 from . import analysis, dsp
+from . import mystery
 from .hub import Conn, Hub, RpcError, encode_f32
 
 LATENCY_GUESS = 0.04  # typical output+input latency, used to centre search windows
@@ -131,9 +132,35 @@ async def _calibrate(hub: Hub, rounds, gap, devices) -> dict:
         details.append(res)
         missing = sum(1 for d in res["detections"] if "frame" not in d)
         await hub.progress(f"Round {r + 1}: {len(res['detections']) - missing}/{len(res['detections'])} chirps detected")
+    # speaker check: was each device's chirp heard by anything (itself included)?
+    for c in devs:
+        heard = False
+        for res in details:
+            if c.id in res["device_ids"]:
+                j = res["device_ids"].index(c.id)
+                heard = heard or any(row[j] is not None for row in res["snr"])
+        hub.set_speaker(c.id, heard, "calibration")
     ids = [c.id for c in devs]
     D = analysis.combine_distance_matrices(matrices)
-    layout = analysis.layout_from_distances(ids, D.tolist())
+    rough = {d: p for d, p in (s.get("rough_positions") or {}).items() if d in ids}
+    use_rough = len(rough) == len(ids)
+    # a device nothing could range to has no measured position: keep it only
+    # if the user placed it by hand, and say so
+    ranged = [bool(np.isfinite(np.delete(D[k], k)).any()) for k in range(len(ids))]
+    unlocated = [c.name for c, ok in zip(devs, ranged) if not ok]
+    if not use_rough and unlocated:
+        keep = [k for k, ok in enumerate(ranged) if ok]
+        if len(keep) < 2:
+            raise ValueError("no device heard any other device's chirp")
+        devs = [devs[k] for k in keep]
+        ids = [c.id for c in devs]
+        D = D[np.ix_(keep, keep)]
+    layout = analysis.layout_from_distances(ids, D.tolist(), rough if use_rough else None)
+    layout["from_rough"] = use_rough
+    layout["unlocated"] = [c.id for c, ok in zip(devs, ranged) if not ok] if use_rough else []
+    if use_rough:
+        hub.view = {"rotation": 0.0, "flip": False}
+        hub.store.set_setting("view", hub.view)
     layout["names"] = {c.id: c.name for c in devs}
     layout["colors"] = {c.id: c.color for c in devs}
     layout["speed_of_sound"] = c_sound
@@ -145,6 +172,8 @@ async def _calibrate(hub: Hub, rounds, gap, devices) -> dict:
         "pairs_total": int(len(finite)),
         "rms_residual_m": layout["rms_residual"],
         "excluded_pairs": layout["excluded_pairs"],
+        "unlocated": unlocated,
+        "from_rough": use_rough,
     }
     data = {"layout": layout, "rounds": details, "clip_ids": all_clips, "chirp": params}
     rid = await hub.publish_result("calibration", data, summary)
@@ -154,8 +183,158 @@ async def _calibrate(hub: Hub, rounds, gap, devices) -> dict:
     await hub.progress(
         f"Calibrated {len(ids)} devices: {summary['pairs_measured']}/{summary['pairs_total']} distances, "
         f"fit error {layout['rms_residual'] * 100:.1f}cm"
+        + (f"; ignored {len(layout['excluded_pairs'])} inconsistent distance(s)" if layout["excluded_pairs"] else "")
+        + (f"; could not range to {', '.join(unlocated)}" + (" (left where you placed it)" if use_rough else " (left off the map)") if unlocated else "")
     )
     return {"result_id": rid, "summary": summary, "layout": layout}
+
+
+def _room(hub: Hub):
+    """[x0, y0, x1, y1] walls drawn by the user (map metres), or None."""
+    r = hub.settings.get("room")
+    if isinstance(r, (list, tuple)) and len(r) == 4 and abs(r[2] - r[0]) > 0.5 and abs(r[3] - r[1]) > 0.5:
+        return [float(v) for v in r]
+    return None
+
+
+def _mystery_state(hub: Hub) -> dict:
+    m = hub.settings.get("mystery") or {}
+    return {
+        "marked": dict(m.get("marked") or {}),  # result id -> signature, confirmed by the user
+        "scores": dict(m.get("scores") or {}),  # result id -> 0..1 likeness to the confirmed ones
+        "threshold": float(m.get("threshold", mystery.DEFAULT_THRESHOLD)),
+        "estimate": m.get("estimate"),
+    }
+
+
+def _result_signature(hub: Hub, res: dict | None) -> dict | None:
+    data = (res or {}).get("data") or {}
+    if data.get("signature"):
+        return data["signature"]
+    recs = []
+    for cid in data.get("clip_ids") or []:
+        try:
+            row, samples = hub.store.load_clip(cid)
+        except Exception:
+            continue
+        recs.append(analysis.Recording(row["device_id"], float(row["sr"]), int(row["start_frame"]), samples))
+    return mystery.signature(recs, data.get("devices") or [])
+
+
+# Bump when the way sounds are timed changes: older results are then re-timed
+# from their stored recordings before being pooled with newer ones.
+TIMING_VERSION = 2
+_REANALYSED: dict = {}
+
+
+def _mystery_pitch(m: dict) -> float | None:
+    """Pitch of the confirmed mystery beep, if it has one."""
+    f = [sig["freq"] for sig in m["marked"].values() if sig.get("tonal") and sig.get("freq")]
+    return float(np.median(f)) if f else None
+
+
+def _reanalyse(hub: Hub, rid: int, data: dict, f0: float | None) -> dict | None:
+    """
+    Re-time one stored sound from its recordings with the current rules. With
+    ``f0`` it looks specifically for a beep at that pitch: a located "sound"
+    is often somebody talking with the beep a moment later in the same clip.
+    Returns {"used", "times", "signature", "estimate"} or None.
+    """
+    layout = hub.layout or {}
+    positions = layout.get("positions_by_id") or {}
+    key = (rid, round(f0) if f0 else None, layout.get("result_id"))
+    if key in _REANALYSED:
+        return _REANALYSED[key]
+    recs, exp_c, exp_b = [], {}, {}
+    emitter = data.get("sync_device")
+    by_dev = {d["device_id"]: d for d in data.get("devices", [])}
+    for cid in data.get("clip_ids") or []:
+        try:
+            row, samples = hub.store.load_clip(cid)
+        except Exception:
+            continue
+        d = by_dev.get(row["device_id"]) or {}
+        if not d.get("chirp") or d.get("onset_frame") is None:
+            continue
+        sr = float(row["sr"])
+        recs.append(analysis.Recording(row["device_id"], sr, int(row["start_frame"]), samples))
+        exp_c[row["device_id"]] = d["chirp"]["strongest_frame"] - (0 if row["device_id"] == emitter else 0.02 * sr)
+        exp_b[row["device_id"]] = d["onset_frame"]
+    res = None
+    if len(recs) >= 3 and emitter:
+        try:
+            out = analysis.analyse_beep(
+                recs,
+                positions,
+                {"device_id": emitter, "slot": 0, "expected": exp_c},
+                exp_b,
+                c=layout.get("speed_of_sound", hub.speed_of_sound),
+                self_distance=float(hub.settings.get("self_distance", dsp.DEFAULT_SELF_DISTANCE)),
+                chirp_params=_chirp_params(hub),
+                freq_hint=f0,
+                tonal=True if f0 else data.get("kind", "beep") != "clap",
+                bounds=_room(hub),
+            )
+            times = {d["device_id"]: d["time"] for d in out["devices"] if "time" in d}
+            res = {
+                "used": [d for d in out["used"] if d in times] if out.get("estimate") else [],
+                "times": times,
+                "signature": mystery.signature(recs, out["devices"]),
+                "estimate": out.get("estimate"),
+            }
+        except Exception:
+            res = None
+    if len(_REANALYSED) > 500:
+        _REANALYSED.clear()
+    _REANALYSED[key] = res
+    return res
+
+
+def _mystery_refresh(hub: Hub, m: dict, rescore: bool = False) -> dict:
+    """Re-score recent sounds (if asked) and pool every match into one position."""
+    confirmed = list(m["marked"].values())
+    f0 = _mystery_pitch(m)
+    layout = hub.layout or {}
+    positions = layout.get("positions_by_id") or {}
+    if rescore:
+        m["scores"] = {}
+        if confirmed:
+            for r in hub.store.results(kind="locate", limit=80):
+                res = hub.store.result(r["id"])
+                best = mystery.score(_result_signature(hub, res), confirmed)
+                if f0 and best < m["threshold"]:
+                    re = _reanalyse(hub, r["id"], res.get("data") or {}, f0)
+                    if re:
+                        best = max(best, mystery.score(re["signature"], confirmed))
+                m["scores"][str(r["id"])] = round(best, 3)
+    ids = set(m["marked"]) | {k for k, v in m["scores"].items() if v >= m["threshold"]}
+    sets, used = [], []
+    for rid in sorted(ids, key=int)[-40:]:
+        data = (hub.store.result(int(rid)) or {}).get("data") or {}
+        # only hearings timed against the current map can be pooled
+        if data.get("calibration_id") != layout.get("result_id"):
+            continue
+        own_ok = data.get("timing_version") == TIMING_VERSION and mystery.score(data.get("signature"), confirmed) >= m["threshold"]
+        if own_ok and data.get("estimate"):
+            times = {d["device_id"]: d["time"] for d in data.get("devices", []) if "time" in d}
+            devs = [d for d in data.get("used", []) if d in times and d in positions]
+        else:
+            re = _reanalyse(hub, int(rid), data, f0)
+            if not re or mystery.score(re["signature"], confirmed) < m["threshold"]:
+                continue
+            devs, times = [d for d in re["used"] if d in positions], re["times"]
+        if len(devs) >= 3:
+            sets.append(([positions[d] for d in devs], [times[d] for d in devs]))
+            used.append(int(rid))
+    est = mystery.locate_many(sets, c=layout.get("speed_of_sound", hub.speed_of_sound), bounds=_room(hub)) if sets else None
+    if est:
+        est["result_ids"] = used
+    m["estimate"] = est
+    m["matches"] = len(ids)
+    m["pitch"] = f0
+    hub.update_settings({"mystery": m})
+    hub.mark_dirty()
+    return m
 
 
 def _sync_emitter(hub: Hub, devs: list[Conn]) -> Conn:
@@ -184,7 +363,8 @@ async def _locate(hub: Hub, t_beep: float, onsets: dict, source, label, trigger)
     if not hub.layout:
         raise ValueError("not calibrated yet")
     positions = hub.layout["positions_by_id"]
-    devs = [c for c in hub.listeners() if c.id in positions]
+    hand_placed = set(hub.layout.get("unlocated") or [])
+    devs = [c for c in hub.listeners() if c.id in positions and c.id not in hand_placed]
     if len(devs) < 3:
         raise ValueError(f"need 3 calibrated listening devices, have {len(devs)}")
     params = _chirp_params(hub)
@@ -210,18 +390,63 @@ async def _locate(hub: Hub, t_beep: float, onsets: dict, source, label, trigger)
             beep_expected[o.id] = float(onsets[o.id])
         else:
             beep_expected[o.id] = o.clock.to_frame(t_beep) + LATENCY_GUESS * o.sr
+    # clap (broadband, no clear pitch) or beep (tonal)? The listeners report
+    # how far the strongest frequency stood above the rest when they triggered.
+    proms = sorted(float(r.get("prominence", 0)) for r in ((trigger or {}).get("reports") or {}).values())
+    kind = None
+    if label.startswith("testbeep"):
+        kind = "beep"
+    elif proms:
+        kind = "beep" if proms[len(proms) // 2] >= float(hub.settings.get("trigger", {}).get("tonal_prominence", 30.0)) else "clap"
     out = analysis.analyse_beep(
         recs,
         positions,
         sync,
         beep_expected,
+        tonal=None if kind is None else kind == "beep",
+        bounds=_room(hub),
         c=hub.layout.get("speed_of_sound", hub.speed_of_sound),
         self_distance=float(hub.settings.get("self_distance", dsp.DEFAULT_SELF_DISTANCE)),
         chirp_params=params,
     )
+    # If a mystery beep with a pitch has been confirmed, look for exactly that
+    # in these recordings: it is often masked by speech or other noise that
+    # set the trigger off, and would otherwise be timed on the wrong sound.
+    mys = _mystery_state(hub)
+    f0 = _mystery_pitch(mys)
+    if f0 and not label.startswith("testbeep"):
+        try:
+            hinted = analysis.analyse_beep(
+                recs,
+                positions,
+                sync,
+                beep_expected,
+                c=hub.layout.get("speed_of_sound", hub.speed_of_sound),
+                self_distance=float(hub.settings.get("self_distance", dsp.DEFAULT_SELF_DISTANCE)),
+                chirp_params=params,
+                freq_hint=f0,
+                tonal=True,
+                bounds=_room(hub),
+            )
+            if mystery.score(mystery.signature(recs, hinted["devices"]), list(mys["marked"].values())) >= mys["threshold"]:
+                out, kind = hinted, "beep"
+        except Exception:
+            pass
     names = {c.id: c.name for c in devs}
     for d in out["devices"]:
         d["name"] = names.get(d["device_id"])
+        if d["device_id"] == emitter.id:
+            # the sync chirp doubles as a speaker check for whoever played it
+            hub.set_speaker(emitter.id, bool(d.get("chirp")) and "sync chirp" not in str(d.get("error", "")), "sync chirp")
+    # what it sounded like, and whether that is the beep being hunted
+    try:
+        sig = mystery.signature(recs, out["devices"])
+    except Exception:
+        sig = None
+    out["signature"] = sig
+    out["timing_version"] = TIMING_VERSION
+    mscore = round(mystery.score(sig, list(mys["marked"].values())), 3) if sig and mys["marked"] else None
+    out["mystery_score"] = mscore
     out.update(
         {
             "t_beep": t_beep,
@@ -233,9 +458,14 @@ async def _locate(hub: Hub, t_beep: float, onsets: dict, source, label, trigger)
             "calibration_id": hub.layout.get("result_id"),
         }
     )
+    if kind is None:
+        kind = "beep" if out.get("freq") else "clap"
+    out["kind"] = kind
     est = out.get("estimate")
     summary = {
         "label": label,
+        "kind": kind,
+        "t": t_beep,
         "freq": out.get("freq"),
         "used": len(out.get("used", [])),
         "loudest": out.get("loudest"),
@@ -250,15 +480,29 @@ async def _locate(hub: Hub, t_beep: float, onsets: dict, source, label, trigger)
             out["error_m"] = summary["error_m"]
     else:
         summary["error"] = out.get("error")
+    is_mystery = mscore is not None and mscore >= mys["threshold"]
+    summary["mystery_score"] = mscore
+    summary["mystery"] = is_mystery
     rid = await hub.publish_result("locate", out, summary)
-    msg = f"{label}: "
+    if mscore is not None:
+        mys["scores"][str(rid)] = mscore
+        mys = _mystery_refresh(hub, mys)
+    msg = f"{kind if label == 'beep' else label}: "
     if est:
         msg += f"estimate ({est['x']:.2f}, {est['y']:.2f}) from {summary['used']} devices, fit {est['rms_residual_m'] * 100:.0f}cm"
         if "error_m" in summary:
             msg += f", {summary['error_m'] * 100:.0f}cm from {names.get(source)}"
     else:
         msg += f"no estimate ({out.get('error')}); loudest at {summary.get('loudest_name')}"
+    if is_mystery:
+        msg += f" - sounds like the mystery beep ({mscore * 100:.0f}% match)"
     await hub.progress(msg, result_id=rid)
+    pooled = mys.get("estimate")
+    if is_mystery and pooled:
+        await hub.progress(
+            f"Mystery beep: {pooled['n']} hearings together put it at ({pooled['x']:.2f}, {pooled['y']:.2f}), within about {pooled['radius_m'] * 100:.0f}cm"
+            + (" (at the edge of the searched area: it may be further out)" if pooled.get("at_edge") else "")
+        )
     return {"result_id": rid, "summary": summary}
 
 
@@ -332,7 +576,7 @@ async def selftest(hub: Hub, devices=None) -> dict:
                         row["noise_db"] = dsp.rms_db(pre)
                         row["peak"] = float(np.max(np.abs(x))) if len(x) else 0.0
                         row["clipped"] = row["peak"] > 0.99
-                        found = analysis.find_chirp(rec, dsp.chirp_for_slot(rec.sr, 0, **params), sched, 0.05, 0.6)
+                        found = analysis.find_chirp(rec, dsp.chirp_for_slot(rec.sr, 0, **params), sched, 0.05, 0.6, own=True)
                         if found:
                             row["snr"] = found["snr"]
                             row["latency_ms"] = (found["frame"] - sched) / rec.sr * 1000
@@ -350,6 +594,8 @@ async def selftest(hub: Hub, devices=None) -> dict:
                     problems.append("did not clearly hear its own chirp")
                 row["problems"] = problems
                 rows.append(row)
+                if "error" not in row:
+                    hub.set_speaker(c.id, bool(row.get("ok")), "self-test")
                 await hub.progress(
                     f"Self-test {c.name}: "
                     + (f"SNR {row.get('snr', 0):.0f}, latency {row.get('latency_ms', float('nan')):.0f}ms, noise {row.get('noise_db', float('nan')):.0f}dB" if "snr" in row else row.get("error", "no chirp found"))
@@ -455,6 +701,89 @@ async def run(hub: Hub, name: str, args: dict | None = None):
         hub.update_settings(args)
         await hub.broadcast({"type": "settings", "settings": hub.settings})
         return hub.settings
+    if name == "rough":
+        # hand-placed positions (metres, as drawn on the map). Shown at once
+        # as the layout; the next calibration refines them.
+        pos = {str(d): [float(p[0]), float(p[1])] for d, p in (args.get("positions") or {}).items()}
+        if not pos:
+            hub.update_settings({"rough_positions": None})
+            return {"ok": True}
+        hub.update_settings({"rough_positions": pos})
+        known = {d["id"]: d for d in hub.store.all_devices()}
+        live = {c.id: c for c in hub.conns.values()}
+        ids = list(pos)
+        hub.layout = {
+            "device_ids": ids,
+            "positions": [pos[d] for d in ids],
+            "positions_by_id": pos,
+            "names": {d: (live[d].name if d in live else (known.get(d) or {}).get("name")) for d in ids},
+            "colors": {d: (live[d].color if d in live else (known.get(d) or {}).get("color")) for d in ids},
+            "rough": True,
+            "rms_residual": 0.0,
+            "excluded_pairs": [],
+            "unlocated": [],
+            "speed_of_sound": hub.speed_of_sound,
+            "ts": time.time(),
+        }
+        hub.view = {"rotation": 0.0, "flip": False}
+        hub.store.set_setting("view", hub.view)
+        hub.mark_dirty()
+        return {"ok": True, "devices": len(ids)}
+    if name == "room":
+        # walls: [x0, y0, x1, y1] in map metres, or nothing to remove them
+        r = args.get("room")
+        hub.update_settings({"room": [float(v) for v in r] if r else None})
+        if (hub.settings.get("mystery") or {}).get("marked"):
+            _mystery_refresh(hub, _mystery_state(hub))
+        hub.mark_dirty()
+        return {"room": hub.settings.get("room")}
+    if name == "mark_mystery":
+        # the user confirms (or un-confirms) a located sound as the beep they
+        # are hunting; everything recent is then re-scored against it
+        rid = int(args["result_id"])
+        on = bool(args.get("on", True))
+        mys = _mystery_state(hub)
+        if on:
+            res = hub.store.result(rid)
+            if not res or res.get("kind") != "locate":
+                raise ValueError(f"no located sound with id {rid}")
+            sig = _result_signature(hub, res)
+            f0 = _mystery_pitch(mys)
+            if f0:
+                # the beep may be hiding behind another sound in this clip:
+                # learn from the beep itself if it is there
+                re = _reanalyse(hub, rid, res.get("data") or {}, f0)
+                if re and mystery.score(re["signature"], list(mys["marked"].values())) >= mys["threshold"]:
+                    sig = re["signature"]
+            if not sig:
+                raise ValueError("no usable recording of that sound to learn from")
+            mys["marked"][str(rid)] = sig
+        else:
+            mys["marked"].pop(str(rid), None)
+        mys = _mystery_refresh(hub, mys, rescore=True)
+        n_like = sum(1 for k, v in mys["scores"].items() if v >= mys["threshold"] and k not in mys["marked"])
+        est = mys.get("estimate")
+        await hub.progress(
+            (f"Marked as the mystery beep. " if on else "Unmarked. ")
+            + (f"{len(mys['marked'])} confirmed, {n_like} other recent sound(s) match. " if mys["marked"] else "Nothing is marked as the mystery beep now. ")
+            + (f"Together they put it at ({est['x']:.2f}, {est['y']:.2f}), within about {est['radius_m'] * 100:.0f}cm" + (" (at the edge of the searched area: it may be further out)" if est.get("at_edge") else "") if est else ("No position yet: none of them could be located on the current map." if mys["marked"] else "")),
+            result_id=rid,
+        )
+        return {"confirmed": len(mys["marked"]), "similar": n_like, "estimate": est}
+    if name == "pause_listening":
+        # Ignore everything the listeners hear for a while (used while the
+        # coordinator replays recordings out loud). The microphones stay
+        # open - reopening one on a phone needs a tap - but nothing heard in
+        # the window can trigger a locate. seconds=0 resumes at once.
+        seconds = max(0.0, min(120.0, float(args.get("seconds", 10))))
+        reason = str(args.get("reason", "replay"))
+        now = time.time()
+        kept = [w for w in hub.suppress_windows if w[2] != reason]
+        hub.suppress_windows.clear()
+        hub.suppress_windows.extend(kept)
+        if seconds:
+            hub.suppress(now - 0.5, now + seconds, reason)
+        return {"paused_for": seconds}
     if name == "clear_layout":
         hub.layout = None
         hub.mark_dirty()

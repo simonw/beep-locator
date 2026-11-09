@@ -33,9 +33,19 @@ def _window(rec: Recording, centre_frame: float, before: float, after: float):
     return lo, hi
 
 
-def find_chirp(rec: Recording, template: np.ndarray, expected_frame: float, before: float, after: float):
+# A device hearing its own chirp gets the direct sound from centimetres away:
+# nothing weaker and earlier can be real. (Loud self-recordings that clip
+# produce ghost copies of the chirp a few ms early, which a low threshold
+# would mistake for the first arrival.)
+SELF_FIRST_ARRIVAL_FRAC = 0.7
+
+
+def find_chirp(rec: Recording, template: np.ndarray, expected_frame: float, before: float, after: float, own: bool = False):
     lo, hi = _window(rec, expected_frame, before, after)
-    det = dsp.detect_chirp(rec.samples, template, lo, hi, sr=rec.sr)
+    if own:
+        det = dsp.detect_chirp(rec.samples, template, lo, hi, sr=rec.sr, first_arrival_frac=SELF_FIRST_ARRIVAL_FRAC)
+    else:
+        det = dsp.detect_chirp(rec.samples, template, lo, hi, sr=rec.sr)
     if det is None:
         return None
     return {
@@ -81,7 +91,7 @@ def analyse_calibration(
                 continue
             template = dsp.chirp_for_slot(rec.sr, em["slot"], **chirp_params)
             if i == j:
-                found = find_chirp(rec, template, exp, 0.05, 0.6)
+                found = find_chirp(rec, template, exp, 0.05, 0.6, own=True)
             else:
                 found = find_chirp(rec, template, exp, before, after)
             entry = {"emitter": em["device_id"], "receiver": rec.device_id, "expected": exp}
@@ -116,9 +126,16 @@ def combine_distance_matrices(mats: list) -> np.ndarray:
     return med
 
 
-def layout_from_distances(device_ids: list[str], D) -> dict:
+def layout_from_distances(device_ids: list[str], D, rough: dict | None = None) -> dict:
+    """
+    rough: optional {device_id: [x, y]} placed by hand. When it covers every
+    device the layout is fitted in that frame (see dsp.refine_layout).
+    """
     D = np.array([[np.nan if v is None else v for v in row] for row in D], dtype=np.float64)
-    lay = dsp.fit_layout(D)
+    if rough and all(d in rough for d in device_ids):
+        lay = dsp.refine_layout(D, np.array([rough[d] for d in device_ids], dtype=np.float64))
+    else:
+        lay = dsp.fit_layout(D)
     out = lay.as_dict()
     out["device_ids"] = list(device_ids)
     out["positions_by_id"] = {d: out["positions"][i] for i, d in enumerate(device_ids)}
@@ -136,6 +153,8 @@ def analyse_beep(
     freq_hint: float | None = None,
     min_chirp_snr: float = 6.0,
     min_onset_snr_db: float = 8.0,
+    tonal: bool | None = None,
+    bounds=None,
 ) -> dict:
     """
     Locate a beep using a sync chirp heard by every device shortly after it.
@@ -143,6 +162,9 @@ def analyse_beep(
     sync: {"device_id": emitter, "slot": k, "expected": {device_id: frame}}
     beep_expected: {device_id: approximate frame of the beep onset}
     positions: {device_id: [x, y]} from calibration
+
+    tonal: False for a clap or knock (no pitch: time the broadband leading
+    edge), True for a beep, None to decide from the recording.
 
     For device i, the beep arrival time relative to the sync chirp's emission
     is (onset_i - chirp_i)/sr_i + dist(i, emitter)/c. Those times share a
@@ -167,7 +189,9 @@ def analyse_beep(
         level = dsp.rms_db(seg)
         if best is None or level > best[0]:
             best = (level, rec, lo, hi)
-    if freq is None and best is not None:
+    if tonal is False:
+        freq = None
+    elif freq is None and best is not None:
         _, rec, lo, hi = best
         seg = rec.samples[lo:hi]
         # look at the loudest 60ms of the window
@@ -194,7 +218,7 @@ def analyse_beep(
             continue
         template = dsp.chirp_for_slot(rec.sr, sync.get("slot", 0), **chirp_params)
         before, after = (0.05, 0.6) if rec.device_id == emitter else (0.35, 0.65)
-        ch = find_chirp(rec, template, exp_c, before, after)
+        ch = find_chirp(rec, template, exp_c, before, after, own=rec.device_id == emitter)
         if not ch or ch["snr"] < min_chirp_snr:
             info["error"] = "sync chirp not detected"
             info["chirp"] = ch
@@ -210,6 +234,10 @@ def analyse_beep(
             lo=lo,
             hi=hi,
             min_snr_db=min_onset_snr_db,
+            impulsive=tonal is False,
+            above_floor_db=10.0 if freq is not None else None,
+            bandwidth=1500.0 if freq is not None else 600.0,
+            smooth=0.001 if freq is not None else 0.0005,
         )
         if on is None:
             info["error"] = "beep onset not detected"
@@ -237,10 +265,38 @@ def analyse_beep(
     loudest = [p for p in per_device if "level_db" in p]
     if loudest:
         result["loudest"] = max(loudest, key=lambda p: p["level_db"])["device_id"]
-    if len(ids) >= 3:
+    # Sound cannot reach two listeners further apart in time than the distance
+    # between them allows. If it apparently did, an onset was mis-timed (an
+    # echo, or a different sound): drop the device responsible if that leaves
+    # enough others, otherwise give no position rather than a wrong one.
+    def violations(sel):
+        out = []
+        for a in range(len(sel)):
+            for b in range(a + 1, len(sel)):
+                pa, pb = positions[sel[a]], positions[sel[b]]
+                excess = abs(times[sel[a]] - times[sel[b]]) * c - float(np.hypot(pa[0] - pb[0], pa[1] - pb[1]))
+                if excess > 0.3:
+                    out.append((sel[a], sel[b], excess))
+        return out
+
+    bad = violations(ids)
+    if bad:
+        result["inconsistent"] = [[a, b, round(e, 2)] for a, b, e in bad]
+        if len(ids) >= 4:
+            for cand in sorted(ids, key=lambda d: -sum(1 for a, b, _ in bad if d in (a, b))):
+                rest = [d for d in ids if d != cand]
+                if not violations(rest):
+                    result["dropped"] = cand
+                    ids = rest
+                    bad = []
+                    break
+        result["used"] = ids
+    if bad:
+        result["error"] = "arrival times are not physically possible (echo or a different sound?)"
+    elif len(ids) >= 3:
         P = np.array([positions[d] for d in ids])
         T = np.array([times[d] for d in ids])
-        res = dsp.locate_tdoa(P, T, c=c)
+        res = dsp.locate_tdoa(P, T, c=c, bounds=bounds)
         if res is not None:
             result["estimate"] = res.as_dict()
             # leave-one-out to flag a bad device when we have redundancy
