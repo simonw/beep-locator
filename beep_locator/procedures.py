@@ -729,6 +729,77 @@ async def run(hub: Hub, name: str, args: dict | None = None):
         hub.store.set_setting("view", hub.view)
         hub.mark_dirty()
         return {"ok": True, "devices": len(ids)}
+    if name == "reposition_start":
+        # Step 1: stop reacting to sounds while the devices are carried about.
+        # The listeners stay connected and keep their microphones open.
+        if hub.procedure_lock.locked():
+            raise Busy(f"busy: {hub.current_procedure}")
+        if (hub.settings.get("phase") or "running") == "running":
+            hub.update_settings({"monitoring_before": bool(hub.settings.get("monitoring", True)), "monitoring": False, "phase": "repositioning"})
+        await hub.broadcast({"type": "settings", "settings": hub.settings})
+        await hub.progress("Listening paused: move the devices, then click Repositioned.")
+        hub.mark_dirty()
+        return {"phase": hub.settings["phase"]}
+    if name == "reposition_cancel":
+        # only possible before the old session has been closed
+        if hub.settings.get("phase") == "repositioning":
+            hub.update_settings({"monitoring": bool(hub.settings.get("monitoring_before", True)), "phase": "running"})
+            await hub.broadcast({"type": "settings", "settings": hub.settings})
+            await hub.progress("Repositioning cancelled: carrying on with the same session.")
+        hub.mark_dirty()
+        return {"phase": hub.settings.get("phase")}
+    if name == "reposition_done":
+        # Step 2: the devices are in new places. Close the old session
+        # (keeping what is needed to view it later) and start a new one with
+        # no map; the user now places the devices roughly.
+        if hub.settings.get("phase") != "repositioning":
+            raise ValueError("not repositioning")
+        mys = _mystery_state(hub)
+        previous = {
+            "layout_result_id": (hub.layout or {}).get("result_id"),
+            "layout": hub.layout if (hub.layout or {}).get("rough") else None,
+            "mystery_estimate": mys.get("estimate"),
+            "room": _room(hub),
+            "view": hub.view,
+            "ended": time.time(),
+        }
+        n = len(hub.sessions) + 1
+        rid = await hub.publish_result("session", {"n": n, "previous": previous}, {"n": n})
+        hub.sessions = hub._load_sessions()
+        # start the rough placement from where things were drawn before, so
+        # only the devices that actually moved need dragging far
+        old_pos = (hub.layout or {}).get("positions_by_id") or {}
+        if old_pos:
+            a = np.deg2rad(float(hub.view.get("rotation", 0)))
+            fx = -1.0 if hub.view.get("flip") else 1.0
+            hub.update_settings(
+                {"rough_positions": None}
+            )
+            hub.update_settings(
+                {"rough_positions": {d: [float(np.cos(a) * fx * p[0] - np.sin(a) * p[1]), float(np.sin(a) * fx * p[0] + np.cos(a) * p[1])] for d, p in old_pos.items()}}
+            )
+        hub.layout = None
+        # the confirmed beep is still the same beep; where it is must be
+        # worked out afresh from the new positions
+        mys["estimate"] = None
+        mys["scores"] = {}
+        hub.update_settings({"mystery": mys, "phase": "placing"})
+        await hub.progress(f"Session {n} started. Drag each listener to roughly where it is now, then click Done.", result_id=rid)
+        hub.mark_dirty()
+        return {"phase": "placing", "session": n}
+    if name == "reposition_finish":
+        # Step 3: take the rough placement, measure, and start listening again.
+        if hub.settings.get("phase") != "placing":
+            raise ValueError("not placing devices")
+        if args.get("room") is not None or "room" in args:
+            hub.update_settings({"room": [float(v) for v in args["room"]] if args.get("room") else None})
+        await run(hub, "rough", {"positions": args.get("positions") or {}})
+        res = await calibrate(hub, args.get("rounds"), None, None)
+        hub.update_settings({"monitoring": bool(hub.settings.get("monitoring_before", True)), "phase": "running"})
+        await hub.broadcast({"type": "settings", "settings": hub.settings})
+        await hub.progress("Listening again in the new positions." if hub.settings["monitoring"] else "New positions measured. Listening is off: tick Listen for beeps to start.")
+        hub.mark_dirty()
+        return res
     if name == "room":
         # walls: [x0, y0, x1, y1] in map metres, or nothing to remove them
         r = args.get("room")
@@ -737,6 +808,13 @@ async def run(hub: Hub, name: str, args: dict | None = None):
             _mystery_refresh(hub, _mystery_state(hub))
         hub.mark_dirty()
         return {"room": hub.settings.get("room")}
+    if name == "mystery_clear":
+        # forget what the mystery beep sounds like (it is otherwise kept
+        # across sessions, since moving the listeners doesn't change the beep)
+        hub.update_settings({"mystery": {"marked": {}, "scores": {}, "estimate": None, "matches": 0, "pitch": None}})
+        await hub.progress("Forgot the mystery beep's sound. Mark a beep again to teach it.")
+        hub.mark_dirty()
+        return {"ok": True}
     if name == "mark_mystery":
         # the user confirms (or un-confirms) a located sound as the beep they
         # are hunting; everything recent is then re-scored against it

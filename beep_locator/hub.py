@@ -177,6 +177,12 @@ class Hub:
         if latest and latest["data"].get("layout"):
             self.layout = latest["data"]["layout"]
             self.layout["result_id"] = latest["id"]
+        # Sessions: a new one starts each time the devices are repositioned.
+        # Each is marked by a result of kind "session"; a result belongs to
+        # the session whose marker has the greatest id below its own.
+        self.sessions = self._load_sessions()
+        if len(self.sessions) > 1 and (self.layout or {}).get("result_id", 0) < self.sessions[-1]["start_id"]:
+            self.layout = None  # devices were moved after the last calibration
         self.view = store.get_settings().get("view", {"rotation": 0, "flip": False})
         # device id -> {"ok", "ts", "how"}: did anything hear this device's
         # speaker the last time it was asked to play?
@@ -331,6 +337,8 @@ class Hub:
             "settings": self.settings,
             "view": self.view,
             "speakers": self.speakers,
+            "sessions": self.sessions,
+            "phase": self.settings.get("phase") or "running",
             "public_url": self.public_url,
             "procedure": self.current_procedure,
             "server_time": time.time(),
@@ -450,6 +458,15 @@ class Hub:
                     self._module_mtimes[key] = m
             except Exception as e:  # pragma: no cover
                 print("module watcher error", e)
+
+    def _load_sessions(self) -> list:
+        first = self.store.query("select min(ts) from results")["rows"]
+        t0 = first[0][0] if first and first[0][0] else time.time()
+        out = [{"n": 1, "start_id": 0, "ts": t0, "previous": None}]
+        for r in self.store.results(kind="session", limit=10000, full=True):
+            out[-1]["end_ts"] = r["ts"]
+            out.append({"n": len(out) + 1, "start_id": r["id"], "ts": r["ts"], "previous": (r.get("data") or {}).get("previous")})
+        return out
 
     def set_speaker(self, device_id: str, ok: bool, how: str):
         self.speakers[device_id] = {"ok": bool(ok), "ts": time.time(), "how": how}

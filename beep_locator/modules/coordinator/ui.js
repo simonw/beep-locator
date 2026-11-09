@@ -47,7 +47,22 @@ function procrustes2d(A, B) {
 export default function setup(ctx) {
   const rt = ctx.rt;
   let state = null;
-  const results = new Map(); // id -> {id, ts, kind, summary, data?}
+  // id -> {id, ts, kind, summary, data?}. Kept on the runtime so results that
+  // arrived live survive this module being hot-swapped.
+  const liveResults = rt.__coResults || (rt.__coResults = new Map());
+  let results = liveResults; // what is on screen: live, or a past session being viewed
+  // -- sessions --------------------------------------------------------------
+  // A new session starts each time the devices are repositioned. `viewing` is
+  // set while looking (read-only) at an earlier one.
+  let viewing = null; // {n, results, layout, room, view, estimate, since}
+  let wizardRough = false; // rough mode was switched on by the reposition steps
+  const sessions = () => (state && state.sessions && state.sessions.length ? state.sessions : [{ n: 1, start_id: 0, ts: 0 }]);
+  const curSession = () => sessions()[sessions().length - 1];
+  const inScope = (r) => !!viewing || r.id > curSession().start_id;
+  const LAY = () => (viewing ? viewing.layout : state && state.layout);
+  const VIEW = () => (viewing ? viewing.view : state && state.view) || { rotation: 0, flip: false };
+  const ROOM = () => (viewing ? viewing.room : state && state.settings && state.settings.room);
+  const phase = () => (state && state.phase) || "running";
   const logLines = [];
   let simTruth = null;
   let onsetCount = 0;
@@ -85,6 +100,10 @@ export default function setup(ctx) {
     .co .logline { white-space: pre-wrap; padding: 1px 0; }
     .co .logline.sound { font-weight: 600; }
     .co .playbtn { padding: 0 6px; min-width: 0; line-height: 1.5; font-size: 0.85em; border-radius: 6px; cursor: pointer; }
+    .co .wizard .step { border: 2px solid var(--warn, #d69e2e); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
+    .co .wizard .step b.t { display: block; font-size: 1.1em; margin-bottom: 4px; }
+    .co .viewbar { display: none; border: 2px solid var(--warn, #d69e2e); border-radius: 10px; padding: 8px 12px; margin-bottom: 8px; }
+    .co .viewbar.on { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
     .co .mysbtn.on { background: #c026d3; color: white; border-color: #c026d3; }
     .co .replay { display: none; margin: 0 0 10px; padding: 10px 12px; border-radius: 10px; border: 2px solid var(--warn, #d69e2e); }
     .co .replay.on { display: block; }
@@ -106,6 +125,7 @@ export default function setup(ctx) {
       </div>
       <div class="card">
         <h2>Controls</h2>
+        <div class="wizard"></div>
         <div class="row">
           <button class="primary" data-act="calibrate">Calibrate</button>
           <label><input type="checkbox" data-act="monitoring"> Listen for beeps</label>
@@ -120,12 +140,16 @@ export default function setup(ctx) {
         <div class="row small">
           Map: <button data-act="rot-">&#8634;</button><button data-act="rot+">&#8635;</button><button data-act="flip">Flip</button>
         </div>
+        <div class="row small mysinfo"></div>
         <div class="progress small muted"></div>
       </div>
       <div class="card"><h2>Devices</h2><div class="devices"></div></div>
     </div>
     <div>
-      <div class="card mapwrap"><svg class="map" viewBox="0 0 800 600"></svg>
+      <div class="card mapwrap">
+        <div class="viewbar"></div>
+        <div class="row small sessbar" style="margin-top:0"><label>Session <select data-session></select></label> <span class="muted sessnote"></span></div>
+        <svg class="map" viewBox="0 0 800 600"></svg>
         <div class="since small" style="margin: 8px 0 6px">
           <input type="range" min="0" max="0" step="1" value="0" style="display:block; width:100%; margin:0" aria-label="Show sounds on the map from this time onwards" title="Slide right to hide older sounds from the map, left to bring them back">
           <div class="row" style="justify-content:space-between; margin-top:4px">
@@ -161,7 +185,7 @@ export default function setup(ctx) {
       .slice()
       .reverse()
       .map((l) => {
-        const r = l.rid != null ? results.get(l.rid) : null;
+        const r = l.rid != null ? liveResults.get(l.rid) : null;
         const sound = r && r.kind === "locate";
         const k = sound ? kindOf(r) : null;
         const btn = sound ? `<button class="playbtn" data-act="replay" data-id="${r.id}" title="Replay what each listener recorded">${replay.rid === r.id ? "&#9632;" : "&#9654;"}</button> ` : "";
@@ -196,7 +220,16 @@ export default function setup(ctx) {
       const name = (prompt("Name for this device (e.g. where it is)", b.dataset.name) || "").trim();
       if (name && name !== b.dataset.name) cmd("rename", { device: b.dataset.dev, name }).catch(() => {});
     }
-    else if (act === "since-now") setSince(Date.now() / 1000);
+    else if (act === "repos-start") cmd("reposition_start").catch(() => {});
+    else if (act === "repos-cancel") cmd("reposition_cancel").catch(() => {});
+    else if (act === "repos-done") cmd("reposition_done").catch(() => {});
+    else if (act === "repos-finish") {
+      if (Object.keys(roughPos).length < 2) q(".progress").textContent = "Need at least two listeners connected.";
+      else cmd("reposition_finish", { positions: roughPos, room: roomEdit }).catch(() => {});
+    } else if (act === "view-live") viewSession(curSession().n);
+    else if (act === "mystery-clear") {
+      if (confirm("Forget what the mystery beep sounds like? You would need to mark a beep again.")) cmd("mystery_clear").catch(() => {});
+    } else if (act === "since-now") setSince(Date.now() / 1000);
     else if (act === "since-all") setSince(0);
     else if (act === "replay") toggleReplay(Number(b.dataset.id));
     else if (act === "replay-stop") stopReplay("stopped");
@@ -216,7 +249,7 @@ export default function setup(ctx) {
     }
     else if (act === "zoom-") zoomRough(1.25);
     else if (act === "zoom+") zoomRough(0.8);
-    else if (act === "rot-" || act === "rot+" || act === "flip") {
+    else if ((act === "rot-" || act === "rot+" || act === "flip") && !viewing) {
       const v = state.view || { rotation: 0, flip: false };
       const nv = { rotation: (v.rotation || 0) + (act === "rot-" ? -15 : act === "rot+" ? 15 : 0), flip: act === "flip" ? !v.flip : !!v.flip };
       state.view = nv;
@@ -238,7 +271,11 @@ export default function setup(ctx) {
   const mScore = (id) => (mys().scores || {})[id];
   const isLikely = (id) => !isMarked(id) && mScore(id) != null && mScore(id) >= (mys().threshold || 0.75);
   const mysteryButton = (id, big) =>
-    isMarked(id)
+    viewing
+      ? isMarked(id)
+        ? `<span style="color:${MYS}">&#9678; mystery beep</span>`
+        : ""
+      : isMarked(id)
       ? `<button class="playbtn mysbtn on" data-act="mystery" data-id="${id}" data-on="0" title="Click to undo">&#9678; ${big ? "Marked as the mystery beep (undo)" : "Mystery beep &#10003;"}</button>`
       : `${isLikely(id) ? `<span style="color:${MYS}" title="Sounds like the beep you confirmed">&#9678; likely ${Math.round(mScore(id) * 100)}%</span> ` : ""}<button class="playbtn mysbtn" data-act="mystery" data-id="${id}" data-on="1" title="Tell the system this is the beep you are hunting. Replay it first to check.">${big ? "&#9678; This is the mystery beep" : isLikely(id) ? "Confirm" : "This is the mystery beep"}</button>`;
   const GAP = 0.6; // silence between listeners, seconds
@@ -375,6 +412,115 @@ export default function setup(ctx) {
       await new Promise((done) => setTimeout(done, GAP * 1000));
     }
     if (token === replay.token) stopReplay("Replay finished");
+  }
+
+  // -- viewing an earlier session (read-only) --------------------------------
+  async function viewSession(n) {
+    const ss = sessions();
+    if (n >= ss.length || n < 1) {
+      viewing = null;
+      results = liveResults;
+      selected = null;
+      renderAll();
+      return;
+    }
+    const sx = ss[n - 1],
+      next = ss[n];
+    q(".sessnote").textContent = "loading…";
+    try {
+      const rows = (await (await api(`/api/results?since_id=${sx.start_id}&limit=5000`)).json()).results.filter((r) => r.id < next.start_id);
+      const prev = next.previous || {};
+      let layout = prev.layout || null;
+      const cals = rows.filter((r) => r.kind === "calibration");
+      const calId = prev.layout_result_id || (cals.length ? cals[cals.length - 1].id : null);
+      if (!layout && calId) {
+        const full = await (await api(`/api/results/${calId}`)).json();
+        layout = full.data && full.data.layout;
+        if (layout) layout.result_id = calId;
+      }
+      viewing = { n, results: new Map(rows.map((r) => [r.id, r])), layout, room: prev.room || null, view: prev.view || null, estimate: prev.mystery_estimate || null, since: 0, ts: sx.ts, end: next.ts };
+      results = viewing.results;
+      selected = null;
+      if (roughMode && !wizardRough) {
+        roughMode = false;
+        frozen = null;
+        q('[data-act="rough"]').checked = false;
+      }
+    } catch (e) {
+      log(`could not load session ${n}: ${e.message}`);
+      viewing = null;
+      results = liveResults;
+    }
+    renderAll();
+  }
+  root.addEventListener("change", (e) => {
+    if (e.target.matches("[data-session]")) viewSession(Number(e.target.value));
+  });
+
+  // the reposition steps, the session picker and what is disabled when
+  function renderSession() {
+    const ph = phase();
+    // rough mode follows the "place them" step
+    if (ph === "placing" && !viewing) {
+      if (!roughMode) {
+        seedRough();
+        if (Object.keys(roughPos).length) {
+          freezeView();
+          roomEdit = (state.settings && state.settings.room && state.settings.room.slice()) || null;
+          roughMode = true;
+          wizardRough = true;
+        }
+      }
+    } else if (wizardRough && ph !== "placing") {
+      wizardRough = false;
+      roughMode = false;
+      frozen = null;
+      drag = null;
+    }
+    const busy = !!state.procedure;
+    let w = "";
+    if (viewing) w = "";
+    else if (ph === "repositioning")
+      w = `<div class="step"><b class="t">Step 1 of 3 · Move the devices</b>Listening is paused, so nothing you do now is located or recorded as a sound. Leave each listener's page open with its screen on. When every device is in its new place:
+        <div class="row"><button class="primary" data-act="repos-done">Repositioned</button><button data-act="repos-cancel" title="Carry on with the same session: only if nothing was moved">Cancel, nothing moved</button></div></div>`;
+    else if (ph === "placing")
+      w = busy
+        ? `<div class="step"><b class="t">Step 3 of 3 · Measuring</b>The listeners are chirping to measure their exact positions…</div>`
+        : `<div class="step"><b class="t">Step 2 of 3 · Roughly place them</b>Session ${curSession().n} has started. On the map, drag each dot to roughly where that listener is now (Identify makes one chirp so you can tell which is which).${roomEdit ? " The walls are where you left them." : ""}
+        <div class="row"><button class="primary" data-act="repos-finish">Done, measure positions</button></div></div>`;
+    else w = `<div class="row"><button data-act="repos-start" ${busy ? "disabled" : ""} title="Pause, move the devices, then start a new session. The listeners stay connected.">Reposition the devices</button></div>`;
+    setHtml(q(".wizard"), w);
+    // session picker
+    const ss = sessions();
+    const span = (x, i) => `${hms(x.ts)}${i < ss.length - 1 ? "–" + hms(ss[i + 1].ts) : " onwards"}`;
+    setHtml(
+      q("[data-session]"),
+      ss
+        .map((x, i) => `<option value="${x.n}">${x.n}${i === ss.length - 1 ? " (live)" : ""} · ${span(x, i)}</option>`)
+        .reverse()
+        .join("")
+    );
+    q("[data-session]").value = String(viewing ? viewing.n : curSession().n);
+    q(".sessnote").textContent = ss.length > 1 ? "earlier sessions can be viewed read-only" : "a new session starts when you reposition the devices";
+    const vb = q(".viewbar");
+    vb.classList.toggle("on", !!viewing);
+    setHtml(vb, viewing ? `<span><b>Viewing session ${viewing.n}</b> (${hms(viewing.ts)}–${hms(viewing.end)}) · read-only: the map, sounds and replays are as they were. The live session is still running.</span><button class="primary" data-act="view-live">Back to live</button>` : "");
+    // nothing that changes the live session while viewing or mid-reposition
+    const lock = !!viewing || ph !== "running";
+    for (const sel of ['[data-act="calibrate"]', '[data-act="rough"]', '[data-act="testbeep"]', '[data-act="locate"]', '[data-act="monitoring"]', '[data-act="rot-"]', '[data-act="rot+"]', '[data-act="flip"]']) {
+      const el = q(sel);
+      if (el) el.disabled = lock || (busy && sel === '[data-act="calibrate"]');
+    }
+    q('[data-act="rough"]').checked = roughMode && !wizardRough;
+    // what the system knows about the mystery beep
+    const m = mys();
+    const nMarked = Object.keys(m.marked || {}).length;
+    setHtml(
+      q(".mysinfo"),
+      nMarked
+        ? `<span style="color:${MYS}">&#9678; Mystery beep</span> <span>${m.pitch ? `${Math.round(m.pitch)} Hz · ` : ""}${nMarked} confirmed · remembered across sessions</span> <button data-act="mystery-clear" ${viewing ? "disabled" : ""} title="Forget what it sounds like">Forget this sound</button>`
+        : `<span class="muted">&#9678; No mystery beep marked yet: replay a located sound and click "This is the mystery beep".</span>`
+    );
   }
 
   // -- rough mode ----------------------------------------------------------
@@ -519,7 +665,7 @@ export default function setup(ctx) {
 
   // -- view transform ------------------------------------------------------
   function viewTf(p) {
-    const v = (state && state.view) || { rotation: 0, flip: false };
+    const v = VIEW();
     let x = p[0],
       y = p[1];
     if (v.flip) x = -x;
@@ -548,14 +694,21 @@ export default function setup(ctx) {
   const rTime = (r) => (r.summary && r.summary.t) || (r.data && r.data.t_beep) || r.ts;
   function allLocates() {
     return Array.from(results.values())
-      .filter((r) => r.kind === "locate" && r.summary && r.summary.x != null)
+      .filter((r) => r.kind === "locate" && r.summary && r.summary.x != null && inScope(r))
       .sort((a, b) => a.id - b.id);
   }
   function latestLocates(n = 25) {
     const all = allLocates();
+    if (viewing) return all.filter((r) => rTime(r) >= viewing.since);
     return sinceTs == null ? all.slice(-n) : all.filter((r) => rTime(r) >= sinceTs);
   }
   function setSince(ts) {
+    if (viewing) {
+      viewing.since = ts || 0;
+      selected = null;
+      draw();
+      return;
+    }
     sinceTs = ts;
     try {
       if (ts == null) localStorage.removeItem("beep.since");
@@ -564,11 +717,13 @@ export default function setup(ctx) {
     selected = null;
     draw();
   }
+  const sinceTsLive = () => sinceTs;
   function updateSince() {
     const all = allLocates();
     const slider = q(".since input");
     const shown = latestLocates().length;
     slider.max = all.length;
+    const sinceTs = viewing ? viewing.since : sinceTsLive();
     slider.value = sinceTs == null ? Math.max(0, all.length - 25) : all.filter((r) => rTime(r) < sinceTs).length;
     slider.disabled = !all.length;
     q(".since-label").textContent = !all.length
@@ -584,7 +739,7 @@ export default function setup(ctx) {
 
   function draw() {
     if (!state) return;
-    const L = state.layout;
+    const L = LAY();
     const W = 800,
       H = 600,
       pad = 50;
@@ -592,7 +747,7 @@ export default function setup(ctx) {
     updateSince();
     svg.classList.toggle("rough", roughMode);
     q(".legend").innerHTML = roughMode
-      ? `<b>Rough mode.</b> Drag each dot to roughly where that listener is: each square is 1 m. Use Identify if you're not sure which is which. <button data-act="zoom-">Zoom out</button> <button data-act="zoom+">Zoom in</button> ${roomEdit ? '<button data-act="walls-remove">Remove walls</button> Drag the two square handles to the room\'s corners.' : '<button data-act="walls-add">Add walls</button>'} Untick rough mode when done and the listeners will chirp to measure their exact positions.`
+      ? `<b>Rough mode.</b> Drag each dot to roughly where that listener is: each square is 1 m. Use Identify if you're not sure which is which. <button data-act="zoom-">Zoom out</button> <button data-act="zoom+">Zoom in</button> ${roomEdit ? '<button data-act="walls-remove">Remove walls</button> Drag the two square handles to the room\'s corners.' : '<button data-act="walls-add">Add walls</button>'} ${wizardRough ? "Click <b>Done, measure positions</b> when they are all placed." : "Untick rough mode when done and the listeners will chirp to measure their exact positions."}`
       : L && L.rough
         ? "These positions are your rough placement, not yet measured. Press Calibrate to measure."
         : `Dots are listeners. <span style="color:${KIND_COLOR.beep}">&#10005;</span> beep, <span style="color:${KIND_COLOR.clap}">&#9671;</span> clap, <span style="color:${KIND_COLOR.test}">&#10005;</span> test beep (newest is largest). <span style="color:${MYS}">&#9678;</span> the mystery beep: ringed symbols are hearings of it, the bullseye is where they jointly point. Shading shows where the latest sound could plausibly be.`;
@@ -605,7 +760,11 @@ export default function setup(ctx) {
         }
     }
     if (!L && !roughMode) {
-      svg.innerHTML = `<text x="400" y="300" text-anchor="middle" fill="currentColor" opacity="0.6" font-size="20">Connect 3+ listeners, then press Calibrate</text><text x="400" y="330" text-anchor="middle" fill="currentColor" opacity="0.45" font-size="15">or tick Rough mode to place them by hand first</text>`;
+      svg.innerHTML = viewing
+        ? `<text x="400" y="300" text-anchor="middle" fill="currentColor" opacity="0.6" font-size="20">Session ${viewing.n} was never calibrated</text>`
+        : phase() === "repositioning"
+          ? `<text x="400" y="300" text-anchor="middle" fill="currentColor" opacity="0.6" font-size="20">Paused: move the devices, then click Repositioned</text>`
+          : `<text x="400" y="300" text-anchor="middle" fill="currentColor" opacity="0.6" font-size="20">Connect 3+ listeners, then press Calibrate</text><text x="400" y="330" text-anchor="middle" fill="currentColor" opacity="0.45" font-size="15">or tick Rough mode to place them by hand first</text>`;
       return;
     }
     const ids = roughMode ? Object.keys(roughPos) : L.device_ids;
@@ -687,7 +846,7 @@ export default function setup(ctx) {
       if (truthPts.beeper) parts.push(`<rect x="${X(truthPts.beeper) - 9}" y="${Y(truthPts.beeper) - 9}" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><text x="${X(truthPts.beeper) + 12}" y="${Y(truthPts.beeper) + 22}" font-size="12" fill="currentColor" opacity="0.6">true beeper (sim)</text>`);
     }
     // walls, if drawn
-    const room = roughMode ? roomEdit : state.settings && state.settings.room;
+    const room = roughMode ? roomEdit : ROOM();
     if (room) {
       const cs = [
         [room[0], room[1]],
@@ -703,7 +862,7 @@ export default function setup(ctx) {
         });
     }
     // where all hearings of the mystery beep, taken together, put it
-    const pooled = !roughMode && mys().estimate;
+    const pooled = !roughMode && (viewing ? viewing.estimate : mys().estimate);
     if (pooled) {
       const p = viewTf([pooled.x, pooled.y]);
       const rr = Math.max(14, pooled.radius_m * s);
@@ -797,7 +956,7 @@ export default function setup(ctx) {
 
   function renderResults() {
     const locs = Array.from(results.values())
-      .filter((r) => r.kind === "locate" || r.kind === "calibration")
+      .filter((r) => (r.kind === "locate" || r.kind === "calibration") && inScope(r))
       .sort((a, b) => b.id - a.id)
       .slice(0, 30);
     const rows = locs.map((r) => {
@@ -835,7 +994,7 @@ export default function setup(ctx) {
       q(".join a").textContent = join;
     }
     q('[data-act="monitoring"]').checked = !!(state.settings && state.settings.monitoring);
-    q('[data-act="calibrate"]').disabled = !!state.procedure;
+    renderSession();
     if (state.procedure) q(".progress").textContent = `running: ${state.procedure}...`;
     renderDevices();
     renderResults();
@@ -848,7 +1007,7 @@ export default function setup(ctx) {
   };
   ctx.on("state", onState);
   const onHistory = (m) => {
-    for (const r of m.results || []) results.set(r.id, r);
+    for (const r of m.results || []) liveResults.set(r.id, r);
     for (const e of m.events || []) {
       if (e.topic === "progress") log(e.data.message, { ts: e.ts, rid: e.data.result_id });
       if (e.topic === "sim_truth") simTruth = e.data;
@@ -860,8 +1019,8 @@ export default function setup(ctx) {
   if (rt.last.history) onHistory(rt.last.history);
   if (rt.last.state) onState(rt.last.state);
   ctx.on("result", (m) => {
-    results.set(m.id, { id: m.id, ts: Date.now() / 1000, kind: m.kind, summary: m.summary, data: m.data });
-    selected = null;
+    liveResults.set(m.id, { id: m.id, ts: Date.now() / 1000, kind: m.kind, summary: m.summary, data: m.data });
+    if (!viewing) selected = null;
     renderResults();
     renderDevices();
     draw();
