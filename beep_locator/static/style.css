@@ -1,0 +1,164 @@
+:root {
+  --bg: #f6f6f3;
+  --fg: #1b1b1b;
+  --muted: #6b6b6b;
+  --card: #ffffff;
+  --line: #ddd;
+  --accent: #2b6cb0;
+  --ok: #2f855a;
+  --warn: #b7791f;
+  --bad: #c53030;
+  --device: #888;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161616;
+    --fg: #eee;
+    --muted: #9a9a9a;
+    --card: #222;
+    --line: #3a3a3a;
+    --accent: #63b3ed;
+  }
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+button {
+  font: inherit;
+  padding: 0.5em 0.9em;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--fg);
+  cursor: pointer;
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+input,
+select {
+  font: inherit;
+  padding: 0.35em 0.5em;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--fg);
+}
+.muted {
+  color: var(--muted);
+}
+.ok {
+  color: var(--ok);
+}
+.warn {
+  color: var(--warn);
+}
+.bad {
+  color: var(--bad);
+}
+code,
+pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+}
+
+/* listener */
+.listener-band {
+  background: var(--device);
+  color: white;
+  padding: 18px 16px;
+  text-align: center;
+  transition: filter 0.2s;
+}
+.listener-band h1 {
+  margin: 0;
+  font-size: 2.6em;
+  letter-spacing: 0.02em;
+}
+.listener-band .sub {
+  opacity: 0.85;
+}
+.flash {
+  animation: flash 0.25s 4;
+}
+@keyframes flash {
+  50% {
+    filter: brightness(2.2);
+  }
+}
+.listener-main {
+  padding: 16px;
+  max-width: 640px;
+  margin: 0 auto;
+}
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  padding: 16px;
+}
+.overlay .box {
+  background: var(--card);
+  color: var(--fg);
+  border-radius: 14px;
+  padding: 22px;
+  max-width: 420px;
+  text-align: center;
+}
+.overlay button {
+  font-size: 1.3em;
+  padding: 0.8em 1.4em;
+  margin-top: 10px;
+}
+.meter {
+  height: 14px;
+  background: var(--line);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.meter > div {
+  height: 100%;
+  width: 0;
+  background: var(--ok);
+  transition: width 0.15s;
+}
+.statusgrid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 12px 0;
+}
+.log {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.tips {
+  font-size: 0.9em;
+}
+.tips li {
+  margin: 3px 0;
+}

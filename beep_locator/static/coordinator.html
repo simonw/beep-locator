@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beep Locator</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  #shell-bar { display: flex; gap: 12px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  #shell-bar h1 { font-size: 1.15em; margin: 0; }
+  #shell-bar .spacer { flex: 1; }
+  #token-form { padding: 30px 16px; max-width: 480px; margin: 0 auto; display: none; }
+  #token-form input { width: 100%; margin: 8px 0; }
+  #app { padding: 0 0 30px; }
+</style>
+</head>
+<body>
+<div id="shell-bar">
+  <h1>Beep Locator</h1>
+  <span id="conn" class="muted">connecting...</span>
+  <span class="spacer"></span>
+  <button id="self-listen" title="Use this computer's microphone and speaker as one of the listeners">Also listen on this device</button>
+</div>
+<div id="token-form">
+  <h2>Coordinator token</h2>
+  <p class="muted">Paste the token printed by <code>beep-locator serve</code> (or open the full coordinator URL it printed).</p>
+  <input id="token-input" placeholder="token" autocomplete="off">
+  <button class="primary" id="token-save">Continue</button>
+</div>
+<div id="app" data-modules></div>
+<script type="module">
+import { Runtime, WebAudioIO, captureErrors, persistentId } from "/static/runtime.js?v=2026-11-09.1";
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+let token = params.get("token");
+try {
+  if (token) {
+    localStorage.setItem("beep-locator-token", token);
+    params.delete("token");
+    history.replaceState(null, "", location.pathname + (params.toString() ? "?" + params : ""));
+  } else {
+    token = localStorage.getItem("beep-locator-token");
+  }
+} catch (e) {}
+
+function askToken() {
+  $("token-form").style.display = "block";
+  $("token-save").onclick = () => {
+    try { localStorage.setItem("beep-locator-token", $("token-input").value.trim()); } catch (e) {}
+    location.reload();
+  };
+}
+
+if (!token) {
+  askToken();
+} else {
+  const rt = new Runtime({ role: "coordinator", io: null, token, root: document.body });
+  rt.moduleRoot = $("app");
+  window.rt = rt;
+  captureErrors(rt);
+  rt.on("connection", ({ connected }) => {
+    $("conn").innerHTML = connected ? '<span class="ok">connected</span>' : '<span class="bad">reconnecting...</span>';
+  });
+  rt.on("auth-failed", () => {
+    $("conn").innerHTML = '<span class="bad">bad token</span>';
+    try { localStorage.removeItem("beep-locator-token"); } catch (e) {}
+    askToken();
+  });
+  rt.connect();
+
+  // Optional: this computer becomes a listener too (separate connection).
+  let selfRt = null;
+  $("self-listen").onclick = async () => {
+    if (selfRt) return;
+    $("self-listen").disabled = true;
+    try {
+      selfRt = new Runtime({ role: "listener", io: new WebAudioIO(), id: persistentId("beep-locator-self-id"), root: document.createElement("div") });
+      window.selfRt = selfRt;
+      captureErrors(selfRt);
+      await selfRt.startAudio();
+      selfRt.connect();
+      selfRt.on("welcome", (w) => {
+        $("self-listen").textContent = `Listening as ${w.name}`;
+        $("self-listen").style.borderColor = w.color;
+      });
+    } catch (e) {
+      $("self-listen").disabled = false;
+      $("self-listen").textContent = "Microphone failed: " + e.message;
+      selfRt = null;
+    }
+  };
+}
+</script>
+</body>
+</html>

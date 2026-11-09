@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beep Locator listener</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="listener-band" id="band">
+  <h1 id="name">Listener</h1>
+  <div class="sub" id="sub">connecting...</div>
+</div>
+<div class="listener-main">
+  <div class="meter" title="microphone level"><div id="meter"></div></div>
+  <div class="statusgrid">
+    <span class="muted">Server</span><span id="s-conn">connecting</span>
+    <span class="muted">Microphone</span><span id="s-audio">not started</span>
+    <span class="muted">Screen lock</span><span id="s-wake">-</span>
+    <span class="muted">Code</span><span id="s-mods">-</span>
+  </div>
+  <div data-modules id="modules"></div>
+  <ul class="tips muted">
+    <li>Put this device down somewhere in the room and leave it.</li>
+    <li>Turn the volume up, switch off silent mode, and unplug headphones or Bluetooth speakers.</li>
+    <li>Keep this page open and in front, and keep the device plugged in if you can.</li>
+  </ul>
+  <details><summary class="muted">Log</summary><div class="log" id="log"></div></details>
+</div>
+<div class="overlay" id="overlay">
+  <div class="box">
+    <h2>Join as a listener</h2>
+    <p>This device will listen through its microphone and play short chirps so the devices can work out where they are.</p>
+    <button class="primary" id="start">Start listening</button>
+    <p class="muted" id="start-msg"></p>
+  </div>
+</div>
+<script type="module">
+import { Runtime, WebAudioIO, captureErrors } from "/static/runtime.js?v=2026-11-09.1";
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const rt = new Runtime({ role: "listener", io: new WebAudioIO(), id: params.get("id"), name: params.get("name"), root: document.body });
+window.rt = rt;
+captureErrors(rt);
+
+rt.on("welcome", (w) => {
+  $("name").textContent = w.name;
+  document.documentElement.style.setProperty("--device", w.color);
+  document.title = `${w.name} - Beep Locator`;
+});
+rt.on("connection", ({ connected }) => {
+  $("s-conn").innerHTML = connected ? '<span class="ok">connected</span>' : '<span class="bad">reconnecting...</span>';
+  $("sub").textContent = connected ? (rt.audioRunning ? "listening" : "connected - tap Start") : "reconnecting...";
+});
+rt.on("identify", () => {
+  const b = $("band");
+  b.classList.remove("flash");
+  void b.offsetWidth;
+  b.classList.add("flash");
+});
+rt.on("log", ({ line }) => {
+  const el = $("log");
+  el.textContent = (el.textContent + "\n" + line).split("\n").slice(-150).join("\n");
+  el.scrollTop = el.scrollHeight;
+});
+rt.on("status", (s) => {
+  const lvl = s.level ? s.level.rms : -100;
+  $("meter").style.width = Math.max(0, Math.min(100, (lvl + 80) * 1.4)) + "%";
+  $("s-audio").innerHTML = s.running
+    ? `<span class="ok">listening</span> <span class="muted">${s.sampleRate} Hz, ${s.level ? s.level.rms.toFixed(0) : "?"} dB${s.gaps ? `, ${s.gaps} gaps` : ""}</span>`
+    : rt.ring ? '<span class="bad">stopped - tap to resume</span>' : "not started";
+  $("s-wake").innerHTML = s.wakeLock ? '<span class="ok">kept awake</span>' : '<span class="warn">may sleep - keep this page open</span>';
+  $("s-mods").textContent = Object.entries(s.modules || {}).map(([k, v]) => `${k}@${String(v).slice(0, 6)}`).join(", ") || "-";
+  if (rt.connected) $("sub").textContent = s.running ? "listening" : "connected - tap Start";
+  if (rt.ring && !s.running) $("overlay").style.display = "flex";
+});
+
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  $("start-msg").textContent = "starting...";
+  try {
+    if (!rt.ring) await rt.startAudio();
+    else await rt.io.resume();
+    $("overlay").style.display = "none";
+    rt.sendStatus();
+  } catch (e) {
+    $("start-msg").innerHTML = `<span class="bad">${e.message}</span>` + (window.isSecureContext ? "" : "<br>This page must be loaded over https:// for microphone access.");
+    rt.reportError("start audio", e);
+  } finally {
+    $("start").disabled = false;
+  }
+};
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    rt.requestWakeLock();
+    if (rt.io && rt.io.ctx && rt.io.ctx.state !== "running") rt.io.resume().catch(() => {});
+  }
+  rt.sendStatus();
+});
+rt.connect();
+</script>
+</body>
+</html>

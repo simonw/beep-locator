@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beep Locator simulated room</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  body { padding: 16px; }
+  .devs { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .dev { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; border-left: 8px solid var(--c, #888); }
+  .dev h3 { margin: 0 0 4px; font-size: 1em; }
+  canvas { background: var(--card); border: 1px solid var(--line); border-radius: 10px; max-width: 100%; }
+</style>
+</head>
+<body>
+<h1>Simulated room</h1>
+<p class="muted">Each box below is a fake listener connected to the server exactly like a real phone would be, but hearing a simulated room instead of a microphone.
+Parameters: <code>?n=5&amp;beeper=1&amp;every=10&amp;bx=3.1&amp;by=2.2&amp;freq=3200&amp;room=5x4&amp;prefix=sim</code></p>
+<canvas id="map" width="520" height="420"></canvas>
+<div class="devs" id="devs"></div>
+<script type="module">
+import { Runtime, captureErrors } from "/static/runtime.js?v=2026-11-09.1";
+import { VirtualRoom } from "/static/sim-io.js?v=2026-11-09.1";
+
+const p = new URLSearchParams(location.search);
+const n = parseInt(p.get("n") || "5");
+const [W, H] = (p.get("room") || "5x4").split("x").map(Number);
+const prefix = p.get("prefix") || "sim";
+const room = new VirtualRoom({ noise: parseFloat(p.get("noise") || "0.002") });
+window.room = room;
+const spots = [
+  [0.3, 0.4], [W - 0.4, 0.6], [W - 0.8, H - 0.3], [0.5, H - 0.7], [W / 2, H / 2 + 0.1], [W / 2, 0.2], [0.2, H / 2], [W - 0.2, H / 2],
+];
+const runtimes = [];
+window.runtimes = runtimes;
+const truth = { devices: {}, beeper: null, room: [W, H] };
+for (let k = 0; k < n; k++) {
+  const [x, y] = spots[k % spots.length];
+  const io = room.addDevice({
+    x, y,
+    sr: k % 2 ? 44100 : 48000,
+    ppm: (Math.random() * 2 - 1) * 40,
+    inLatency: 0.005 + Math.random() * 0.06,
+    outLatency: 0.005 + Math.random() * 0.1,
+  });
+  const box = document.createElement("div");
+  box.className = "dev";
+  box.innerHTML = `<h3>${prefix}-${k + 1}</h3><div class="muted info"></div><div data-modules></div>`;
+  document.getElementById("devs").appendChild(box);
+  const rt = new Runtime({ role: "listener", io, id: `${prefix}-${k + 1}`, sim: true, root: box });
+  captureErrors(rt);
+  rt.on("welcome", (w) => {
+    box.style.setProperty("--c", w.color);
+    box.querySelector("h3").textContent = `${w.name} (${prefix}-${k + 1})`;
+  });
+  rt.on("status", (s) => {
+    box.querySelector(".info").textContent = `${io.sampleRate}Hz ${io.ppm.toFixed(0)}ppm at (${x.toFixed(2)}, ${y.toFixed(2)}) ${rt.connected ? "connected" : "offline"}`;
+  });
+  truth.devices[rt.id] = [x, y];
+  runtimes.push(rt);
+  await rt.startAudio();
+  rt.connect();
+}
+if (p.get("beeper") !== "0") {
+  const bx = parseFloat(p.get("bx") || String(W * 0.62));
+  const by = parseFloat(p.get("by") || String(H * 0.55));
+  room.addBeeper({ x: bx, y: by, every: parseFloat(p.get("every") || "10"), freq: parseFloat(p.get("freq") || "3200"), gain: parseFloat(p.get("gain") || "0.5") });
+  truth.beeper = [bx, by];
+}
+window.truth = truth;
+// tell the coordinator where things really are, so it can show the error
+const announce = () => runtimes[0] && runtimes[0].connected && runtimes[0].send("sim_truth", truth);
+setTimeout(announce, 1500);
+setInterval(announce, 20000);
+
+const cv = document.getElementById("map");
+const g = cv.getContext("2d");
+const S = Math.min((cv.width - 40) / W, (cv.height - 40) / H);
+function draw() {
+  g.clearRect(0, 0, cv.width, cv.height);
+  g.strokeStyle = "#999";
+  g.strokeRect(20, 20, W * S, H * S);
+  runtimes.forEach((rt, k) => {
+    const io = rt.io;
+    g.fillStyle = (rt.welcome && rt.welcome.color) || "#888";
+    g.beginPath();
+    g.arc(20 + io.x * S, 20 + io.y * S, 9, 0, 7);
+    g.fill();
+    g.fillStyle = "#666";
+    g.fillText(rt.welcome ? rt.welcome.name : rt.id, 32 + io.x * S, 24 + io.y * S);
+  });
+  for (const b of room.beepers) {
+    const recent = b.lastTime && room.now() - b.lastTime < 0.4;
+    g.fillStyle = recent ? "#e00" : "#000";
+    g.fillRect(20 + b.x * S - 6, 20 + b.y * S - 6, 12, 12);
+    g.fillText(`beeper ${b.freq}Hz every ${b.every}s (${b.count})`, 30 + b.x * S, 36 + b.y * S);
+  }
+  requestAnimationFrame(draw);
+}
+draw();
+</script>
+</body>
+</html>
