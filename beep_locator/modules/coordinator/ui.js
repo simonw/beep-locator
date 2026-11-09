@@ -126,6 +126,14 @@ export default function setup(ctx) {
     </div>
     <div>
       <div class="card mapwrap"><svg class="map" viewBox="0 0 800 600"></svg>
+        <div class="since small" style="margin: 8px 0 6px">
+          <input type="range" min="0" max="0" step="1" value="0" style="display:block; width:100%; margin:0" aria-label="Show sounds on the map from this time onwards" title="Slide right to hide older sounds from the map, left to bring them back">
+          <div class="row" style="justify-content:space-between; margin-top:4px">
+            <span>Showing on the map: <b class="since-label" style="font-variant-numeric: tabular-nums"></b></span>
+            <span><button data-act="since-now" title="Hide everything so far; new sounds will still appear">Clear map</button> <button data-act="since-all">Show all</button></span>
+          </div>
+          <div class="muted">Slide right to hide older sounds, left to bring them back. Nothing is deleted.</div>
+        </div>
         <div class="small muted legend">Dots are listeners. Crosses are beep estimates (newest is largest). Shading shows where the latest beep could plausibly be.</div>
       </div>
       <div class="card"><h2>Sounds located</h2><div class="replay"></div><div class="results small"></div></div>
@@ -184,6 +192,12 @@ export default function setup(ctx) {
     else if (act === "testbeep") cmd("testbeep", { device: q("[data-test]").value }).catch(() => {});
     else if (act === "locate") cmd("locate", { ago: 1.0, label: "manual" }).catch(() => {});
     else if (act === "identify") cmd("identify", { device: b.dataset.dev }).catch(() => {});
+    else if (act === "rename") {
+      const name = (prompt("Name for this device (e.g. where it is)", b.dataset.name) || "").trim();
+      if (name && name !== b.dataset.name) cmd("rename", { device: b.dataset.dev, name }).catch(() => {});
+    }
+    else if (act === "since-now") setSince(Date.now() / 1000);
+    else if (act === "since-all") setSince(0);
     else if (act === "replay") toggleReplay(Number(b.dataset.id));
     else if (act === "replay-stop") stopReplay("stopped");
     else if (act === "mystery")
@@ -445,6 +459,12 @@ export default function setup(ctx) {
       .catch(() => {});
   }
   q('[data-act="rough"]').addEventListener("change", (e) => setRough(e.target.checked));
+  q(".since input").addEventListener("input", (e) => {
+    const all = allLocates();
+    const v = Number(e.target.value);
+    // far right: nothing so far, only sounds from now on
+    setSince(v >= all.length ? Date.now() / 1000 : v <= 0 ? 0 : rTime(all[v]));
+  });
   function svgPoint(e) {
     const r = svg.getBoundingClientRect();
     return [((e.clientX - r.left) / r.width) * 800, ((e.clientY - r.top) / r.height) * 600];
@@ -517,11 +537,49 @@ export default function setup(ctx) {
   const clock = (r) => new Date(((r.summary && r.summary.t) || (r.data && r.data.t_beep) || r.ts) * 1000).toLocaleTimeString("en-GB", { hour12: false });
   const KIND_COLOR = { beep: "#e53e3e", clap: "#0d9488", test: "#805ad5" };
 
-  function latestLocates(n = 25) {
+  // -- "show sounds from" filter ---------------------------------------------
+  // sinceTs: null = the latest 25 (default), otherwise only sounds at or after
+  // that time are drawn. Nothing is deleted: slide back to see older ones.
+  let sinceTs = null;
+  try {
+    const v = localStorage.getItem("beep.since");
+    if (v != null && v !== "") sinceTs = Number(v);
+  } catch (e) {}
+  const rTime = (r) => (r.summary && r.summary.t) || (r.data && r.data.t_beep) || r.ts;
+  function allLocates() {
     return Array.from(results.values())
       .filter((r) => r.kind === "locate" && r.summary && r.summary.x != null)
-      .sort((a, b) => a.id - b.id)
-      .slice(-n);
+      .sort((a, b) => a.id - b.id);
+  }
+  function latestLocates(n = 25) {
+    const all = allLocates();
+    return sinceTs == null ? all.slice(-n) : all.filter((r) => rTime(r) >= sinceTs);
+  }
+  function setSince(ts) {
+    sinceTs = ts;
+    try {
+      if (ts == null) localStorage.removeItem("beep.since");
+      else localStorage.setItem("beep.since", String(ts));
+    } catch (e) {}
+    selected = null;
+    draw();
+  }
+  function updateSince() {
+    const all = allLocates();
+    const slider = q(".since input");
+    const shown = latestLocates().length;
+    slider.max = all.length;
+    slider.value = sinceTs == null ? Math.max(0, all.length - 25) : all.filter((r) => rTime(r) < sinceTs).length;
+    slider.disabled = !all.length;
+    q(".since-label").textContent = !all.length
+      ? "no sounds located yet"
+      : sinceTs == null
+        ? `latest ${shown} of ${all.length} sounds`
+        : shown === all.length
+          ? `all ${all.length} sounds`
+          : shown
+            ? `from ${hms(rTime(latestLocates()[0]))} onwards · ${shown} of ${all.length} sounds`
+            : `cleared at ${hms(sinceTs)} · ${all.length} older sound${all.length === 1 ? "" : "s"} hidden · new ones will appear`;
   }
 
   function draw() {
@@ -531,6 +589,7 @@ export default function setup(ctx) {
       H = 600,
       pad = 50;
     let parts = [];
+    updateSince();
     svg.classList.toggle("rough", roughMode);
     q(".legend").innerHTML = roughMode
       ? `<b>Rough mode.</b> Drag each dot to roughly where that listener is: each square is 1 m. Use Identify if you're not sure which is which. <button data-act="zoom-">Zoom out</button> <button data-act="zoom+">Zoom in</button> ${roomEdit ? '<button data-act="walls-remove">Remove walls</button> Drag the two square handles to the room\'s corners.' : '<button data-act="walls-add">Add walls</button>'} Untick rough mode when done and the listeners will chirp to measure their exact positions.`
@@ -697,7 +756,7 @@ export default function setup(ctx) {
     if (!state) return;
     const devs = (state.devices || []).filter((d) => d.role === "listener");
     const L = state.layout;
-    const latest = latestLocates(1)[0];
+    const latest = allLocates().slice(-1)[0];
     const levels = {};
     if (latest && latest.data) for (const d of latest.data.devices || []) if (d.level_db != null) levels[d.device_id] = d.level_db;
     const rows = devs.map((d) => {
@@ -727,7 +786,7 @@ export default function setup(ctx) {
         <div class="small muted">${esc(st.sampleRate || "")}${st.sampleRate ? " Hz" : ""} ${lv} ${d.clock && d.clock.rtt_ms != null ? `· ${d.clock.rtt_ms} ms rtt` : ""}</div>
         <div class="small">${mic} · ${spk}</div>
         <div class="small">${flags.join(" ")} ${placed} ${heard}</div></td>
-        <td style="text-align:right"><button class="small" data-act="identify" data-dev="${esc(d.id)}">Identify</button></td></tr>`;
+        <td style="text-align:right; white-space:nowrap"><button class="small" data-act="rename" data-dev="${esc(d.id)}" data-name="${esc(d.name)}" title="Give this device your own name, e.g. where it is">Rename</button> <button class="small" data-act="identify" data-dev="${esc(d.id)}">Identify</button></td></tr>`;
     });
     q(".devices").innerHTML = devs.length ? `<table>${rows.join("")}</table>` : '<div class="muted">No listeners yet. Scan the QR code with a phone.</div>';
     const sel = q("[data-test]");

@@ -165,7 +165,7 @@ async def ws_endpoint(websocket: WebSocket):
     )
     if role == "coordinator":
         await conn.send({"type": "state", "state": hub.state()})
-        await conn.send({"type": "history", "results": hub.store.results(limit=60, full=False), "events": hub.store.events(limit=100)})
+        await conn.send({"type": "history", "results": hub.store.results(limit=400, full=False), "events": hub.store.events(limit=100)})
     await hub.send_modules(conn)
     ping_task = asyncio.create_task(hub.ping_loop(conn))
     hub.store.add_event("connect", {"role": role, "ua": conn.ua, "name": conn.name}, device_id=conn.id)
