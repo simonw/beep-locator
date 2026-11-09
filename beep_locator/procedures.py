@@ -483,6 +483,10 @@ async def _locate(hub: Hub, t_beep: float, onsets: dict, source, label, trigger)
     is_mystery = mscore is not None and mscore >= mys["threshold"]
     summary["mystery_score"] = mscore
     summary["mystery"] = is_mystery
+    # how loud each listener heard it: repeatable to about 1dB for the same
+    # source, so moving one listener and watching its number is a usable
+    # warmer/colder search even when the timing is poor
+    summary["levels"] = {d["device_id"]: round(float(d["level_db"]), 1) for d in out["devices"] if d.get("level_db") is not None}
     rid = await hub.publish_result("locate", out, summary)
     if mscore is not None:
         mys["scores"][str(rid)] = mscore

@@ -100,6 +100,12 @@ export default function setup(ctx) {
     .co .logline { white-space: pre-wrap; padding: 1px 0; }
     .co .logline.sound { font-weight: 600; }
     .co .playbtn { padding: 0 6px; min-width: 0; line-height: 1.5; font-size: 0.85em; border-radius: 6px; cursor: pointer; }
+    .co .loud table td { vertical-align: middle; padding: 6px 4px; }
+    .co .loud .db { font-size: 1.5em; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .co .loud .delta { font-weight: 700; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .co .loud .bar { height: 12px; border-radius: 6px; background: var(--line); overflow: hidden; min-width: 80px; }
+    .co .loud .bar > div { height: 100%; border-radius: 6px; }
+    .co .loud .hist { font-variant-numeric: tabular-nums; white-space: nowrap; }
     .co .wizard .step { border: 2px solid var(--warn, #d69e2e); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
     .co .wizard .step b.t { display: block; font-size: 1.1em; margin-bottom: 4px; }
     .co .viewbar { display: none; border: 2px solid var(--warn, #d69e2e); border-radius: 10px; padding: 8px 12px; margin-bottom: 8px; }
@@ -160,6 +166,7 @@ export default function setup(ctx) {
         </div>
         <div class="small muted legend">Dots are listeners. Crosses are beep estimates (newest is largest). Shading shows where the latest beep could plausibly be.</div>
       </div>
+      <div class="card loudcard" style="display:none"><h2><span style="color:#c026d3">&#9678;</span> Mystery beep loudness <span class="muted small" style="font-weight:400">warmer / colder</span></h2><div class="loud"></div></div>
       <div class="card"><h2>Sounds located</h2><div class="replay"></div><div class="results small"></div></div>
       <div class="card"><h2>Log</h2><div class="log small"></div></div>
     </div>
@@ -413,6 +420,85 @@ export default function setup(ctx) {
     }
     if (token === replay.token) stopReplay("Replay finished");
   }
+
+  // -- mystery beep loudness (warmer / colder) -------------------------------
+  // Each listener's level for successive hearings of the mystery beep. The
+  // same source at the same distance repeats to about 1 dB, so moving one
+  // listener and watching its number change finds the beeper by loudness.
+  function mysteryHearings() {
+    return Array.from(liveResults.values())
+      .filter((r) => r.kind === "locate" && r.summary && r.summary.levels && (r.summary.mystery || isMarked(r.id)) && r.id > curSession().start_id)
+      .sort((a, b) => a.id - b.id);
+  }
+  function beepPeriod(hs) {
+    const gaps = [];
+    for (let i = 1; i < hs.length; i++) {
+      const g = rTime(hs[i]) - rTime(hs[i - 1]);
+      if (g > 20 && g < 600) gaps.push(g);
+    }
+    if (gaps.length < 2) return null;
+    gaps.sort((a, b) => a - b);
+    return gaps[Math.floor(gaps.length / 2)];
+  }
+  function renderLoudness() {
+    const card = q(".loudcard");
+    const nMarked = Object.keys(mys().marked || {}).length;
+    card.style.display = nMarked && !viewing ? "" : "none";
+    if (!nMarked || viewing) return;
+    const hs = mysteryHearings().slice(-8);
+    if (!hs.length) {
+      setHtml(q(".loud"), `<div class="muted">Waiting for the next mystery beep in this session. Each time it sounds, this shows how loud every listener heard it.</div><div class="small muted next"></div>`);
+      return;
+    }
+    const last = hs[hs.length - 1],
+      prev = hs[hs.length - 2];
+    const devs = ((state && state.devices) || []).filter((d) => d.role === "listener");
+    const rows = devs.map((d) => {
+      const cur = last.summary.levels[d.id];
+      const was = prev ? prev.summary.levels[d.id] : null;
+      const delta = cur != null && was != null ? cur - was : null;
+      const dtxt =
+        delta == null
+          ? ""
+          : Math.abs(delta) < 1.5
+            ? `<span class="delta muted">same (${delta >= 0 ? "+" : ""}${fmt(delta, 1)})</span>`
+            : delta > 0
+              ? `<span class="delta" style="color:#dd6b20">&#9650; +${fmt(delta, 1)} dB warmer</span>`
+              : `<span class="delta" style="color:#3182ce">&#9660; ${fmt(delta, 1)} dB colder</span>`;
+      const pct = cur == null ? 0 : Math.max(2, Math.min(100, ((cur + 70) / 60) * 100));
+      const hist = hs.map((h) => (h.summary.levels[d.id] != null ? fmt(h.summary.levels[d.id], 0) : "–")).join(" ");
+      return `<tr><td><span class="sw" style="background:${d.color}"></span><b>${esc(d.name)}</b></td>
+        <td class="db">${cur != null ? fmt(cur, 1) + " dB" : '<span class="muted" style="font-size:0.6em">not heard</span>'}</td>
+        <td>${dtxt}</td>
+        <td style="width:30%"><div class="bar"><div style="width:${pct}%;background:${d.color}"></div></div></td>
+        <td class="hist muted small" title="This listener's level for the last ${hs.length} hearings, oldest first">${hist}</td></tr>`;
+    });
+    setHtml(
+      q(".loud"),
+      `<div class="small">Last heard <b>${clock(last)}</b> <span class="next muted"></span></div>
+      <table>${rows.join("")}</table>
+      <div class="small muted">Move or hold one listener somewhere new, wait for the next beep, and watch its own number: about 6 dB louder means roughly half the distance. Only compare a listener with itself, since each device's microphone is different. Moving a listener makes the map position wrong until you recalibrate.</div>`
+    );
+    tickLoudness();
+  }
+  function tickLoudness() {
+    const el = q(".loud .next");
+    if (!el) return;
+    const hs = mysteryHearings();
+    const period = beepPeriod(hs);
+    if (!hs.length || !period) {
+      el.textContent = "";
+      return;
+    }
+    let due = rTime(hs[hs.length - 1]) + period - Date.now() / 1000;
+    let missed = 0;
+    while (due < -5 && missed < 50) {
+      due += period;
+      missed++;
+    }
+    el.textContent = `· it repeats about every ${Math.round(period)} s · next expected in ~${Math.max(0, Math.round(due))} s${missed ? ` (${missed} since then not caught)` : ""}`;
+  }
+  ctx.setInterval(tickLoudness, 1000);
 
   // -- viewing an earlier session (read-only) --------------------------------
   async function viewSession(n) {
@@ -998,6 +1084,7 @@ export default function setup(ctx) {
     if (state.procedure) q(".progress").textContent = `running: ${state.procedure}...`;
     renderDevices();
     renderResults();
+    renderLoudness();
     draw();
   }
 
@@ -1021,6 +1108,7 @@ export default function setup(ctx) {
   ctx.on("result", (m) => {
     liveResults.set(m.id, { id: m.id, ts: Date.now() / 1000, kind: m.kind, summary: m.summary, data: m.data });
     if (!viewing) selected = null;
+    renderLoudness();
     renderResults();
     renderDevices();
     draw();
