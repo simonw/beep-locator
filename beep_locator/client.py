@@ -46,10 +46,15 @@ class Client:
                 cfg = json.loads(CONFIG.read_text())
             except ValueError:
                 cfg = {}
-        url = url or os.environ.get("BEEP_URL") or cfg.get("url")
+        url = url or os.environ.get("BEEP_URL") or cfg.get("url") or "http://localhost:8765"
         token = token or os.environ.get("BEEP_TOKEN") or cfg.get("token")
-        if not url or not token:
-            raise SystemExit("Set BEEP_URL and BEEP_TOKEN, pass --url/--token, or run `beep-locator ctl login URL TOKEN`")
+        if not token:
+            # a server started from this directory saves its token here
+            f = Path(os.environ.get("BEEP_DATA_DIR", "beep-data")) / "token.txt"
+            if f.exists():
+                token = f.read_text().strip()
+        if not token:
+            raise SystemExit("No token: run from the directory containing beep-data/, set BEEP_TOKEN, or `beep-locator ctl login URL TOKEN`")
         return cls(url, token)
 
     # -- raw HTTP -----------------------------------------------------------

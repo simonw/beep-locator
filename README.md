@@ -19,8 +19,7 @@ need for microphone access, [cloudflared](https://developers.cloudflare.com/clou
 ```bash
 git clone https://github.com/simonw/beep-locator
 cd beep-locator
-git checkout claude/gifted-volta-zgn4dr
-uv run beep-locator serve --tunnel --auto-update
+uv run beep-locator serve --tunnel
 ```
 
 It prints:
@@ -28,8 +27,8 @@ It prints:
 - a **coordinator URL** (contains the admin token - open it on your laptop)
 - a **join URL** plus a QR code: open it on each phone/tablet and tap
   *Start listening*
-- `BEEP_URL=... BEEP_TOKEN=...`: give these to Claude (or any script) to
-  drive the system remotely
+- `BEEP_URL=... BEEP_TOKEN=...` for driving it from elsewhere; locally,
+  `uv run beep-locator ctl ...` finds the server and token automatically
 
 Then:
 
@@ -63,6 +62,7 @@ uv run beep-locator ctl state                      # devices, levels, layout
 uv run beep-locator ctl eval 'return rt.info()' --to Red
 uv run beep-locator ctl push listener myexp exp.js  # install a module everywhere
 uv run beep-locator ctl unpush listener myexp
+uv run beep-locator ctl run selftest               # does each device hear itself?
 uv run beep-locator ctl run calibrate
 uv run beep-locator ctl run testbeep device=Blue
 uv run beep-locator ctl results                    # calibrations and beep estimates

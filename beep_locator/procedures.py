@@ -286,6 +286,83 @@ async def testbeep(hub: Hub, device: str, freq: float = 3200.0, duration: float 
             hub.mark_dirty()
 
 
+async def selftest(hub: Hub, devices=None) -> dict:
+    """
+    Per-device loopback check, one device at a time: play a chirp, record it,
+    and report whether the device hears itself clearly. Also reports what the
+    browser says about echo cancellation / AGC (which must be off) and the
+    round-trip audio latency. Run this first on new hardware.
+    """
+    if hub.procedure_lock.locked():
+        raise Busy(f"busy: {hub.current_procedure}")
+    async with hub.procedure_lock:
+        hub.current_procedure = "selftest"
+        hub.mark_dirty()
+        try:
+            devs = hub.listeners()
+            if devices:
+                wanted = {c.id for c in hub.resolve_targets(devices)}
+                devs = [c for c in devs if c.id in wanted]
+            if not devs:
+                raise ValueError("no listening devices")
+            params = _chirp_params(hub)
+            rows = []
+            for c in devs:
+                row = {"device_id": c.id, "name": c.name}
+                try:
+                    info = await hub.rpc(c, "info", {})
+                    track = ((info or {}).get("io") or {}).get("track") or {}
+                    row["track"] = track
+                    row["io"] = {k: v for k, v in ((info or {}).get("io") or {}).items() if k != "track"}
+                    t = time.time() + 0.3 + c.clock.rtt
+                    hub.suppress(t - 0.3, t + 1.0, "selftest")
+                    sig = dsp.chirp_for_slot(c.sr, 0, **params)
+                    rep = await hub.rpc(c, "play", {"samples": encode_f32(sig), "frame": c.clock.to_frame(t)})
+                    sched = float(rep["frame"])
+                    t_act = c.clock.to_time(sched)
+                    await _sleep_until(t_act + 0.8)
+                    recs, clip_ids = await _fetch_recordings(hub, [c], t_act - 0.4, t_act + 0.8, f"selftest-{c.name}")
+                    if not recs:
+                        row["error"] = "no audio"
+                    else:
+                        rec = recs[0]
+                        row["clip_id"] = clip_ids[0]
+                        x = rec.samples
+                        pre = x[: max(1, int(rec.local(sched)))]
+                        row["noise_db"] = dsp.rms_db(pre)
+                        row["peak"] = float(np.max(np.abs(x))) if len(x) else 0.0
+                        row["clipped"] = row["peak"] > 0.99
+                        found = analysis.find_chirp(rec, dsp.chirp_for_slot(rec.sr, 0, **params), sched, 0.05, 0.6)
+                        if found:
+                            row["snr"] = found["snr"]
+                            row["latency_ms"] = (found["frame"] - sched) / rec.sr * 1000
+                        row["ok"] = bool(found and found["snr"] > 10)
+                except Exception as e:
+                    row["error"] = str(e)
+                problems = []
+                if row.get("track", {}).get("echoCancellation"):
+                    problems.append("echo cancellation is ON")
+                if row.get("track", {}).get("autoGainControl"):
+                    problems.append("auto gain is ON")
+                if row.get("clipped"):
+                    problems.append("clipping (lower chirp amplitude?)")
+                if not row.get("ok"):
+                    problems.append("did not clearly hear its own chirp")
+                row["problems"] = problems
+                rows.append(row)
+                await hub.progress(
+                    f"Self-test {c.name}: "
+                    + (f"SNR {row.get('snr', 0):.0f}, latency {row.get('latency_ms', float('nan')):.0f}ms, noise {row.get('noise_db', float('nan')):.0f}dB" if "snr" in row else row.get("error", "no chirp found"))
+                    + (f" - {'; '.join(problems)}" if problems else " - OK")
+                )
+            summary = {"devices": len(rows), "ok": sum(1 for r in rows if not r["problems"]), "problems": {r["name"]: r["problems"] for r in rows if r["problems"]}}
+            rid = await hub.publish_result("selftest", {"devices": rows}, summary)
+            return {"result_id": rid, "summary": summary, "devices": rows}
+        finally:
+            hub.current_procedure = None
+            hub.mark_dirty()
+
+
 async def identify(hub: Hub, device: str):
     res = await hub.rpc_many(hub.resolve_targets(device), "identify", {}, timeout=5)
     return res
@@ -360,6 +437,8 @@ async def run(hub: Hub, name: str, args: dict | None = None):
         return await locate(hub, t, {}, label=args.get("label", "manual"), trigger={"kind": "manual"})
     if name == "identify":
         return await identify(hub, args.get("device", "listeners"))
+    if name == "selftest":
+        return await selftest(hub, args.get("devices"))
     if name == "monitoring":
         hub.update_settings({"monitoring": bool(args.get("on", True))})
         return {"monitoring": hub.settings["monitoring"]}
@@ -383,4 +462,4 @@ async def run(hub: Hub, name: str, args: dict | None = None):
     raise ValueError(f"unknown procedure: {name}")
 
 
-__all__ = ["run", "calibrate", "locate", "testbeep", "identify", "Monitor", "Busy", "RpcError"]
+__all__ = ["run", "calibrate", "locate", "testbeep", "selftest", "identify", "Monitor", "Busy", "RpcError"]
