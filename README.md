@@ -1,5 +1,9 @@
 # beep-locator
 
+For background on this project, see [Locating the source of a mysterious beep with Claude](https://simonwillison.net/2026/Nov/9/mysterious-beeps/).
+
+*The rest of this README was written by Claude.*
+
 Locate annoying beeps. Laptops, phones and tablets around a room become a
 microphone array: they find each other by playing chirps (two-way acoustic
 ranging, see [problem.md](problem.md)), then work out where a mystery beep
