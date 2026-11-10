@@ -3,6 +3,7 @@ name = "beep-locator"
 version = "0.1.0"
 description = "Find a beeping device by turning laptops, phones and tablets into a microphone array"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     "starlette>=0.40",
@@ -19,7 +20,7 @@ beep-locator = "beep_locator.cli:cli"
 dev = ["pytest>=8", "httpx>=0.27"]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
